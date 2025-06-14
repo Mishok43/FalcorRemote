@@ -128,6 +128,11 @@ class BasicRasterizer:
                 "path": "D:/Models/CornellBox/cornell_box.pyscene",
                 "description": "Classic Cornell Box scene",
                 "exists": False
+            },
+            "bistro_exterior": {
+                "path": "D:/Models/Bistro/BistroExterior.fbx",
+                "description": "Bistro exterior scene",
+                "exists": False
             }
 
         }
