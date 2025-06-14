@@ -1,0 +1,25 @@
+{
+  "object_name": "bug",
+  "base_patterns": [
+    "Is {object} present in the image?",
+    "Is there {object} in the image?",
+    "Can you see {object} in the image?",
+    "Do you see {object} in the image?",
+    "Is {object} visible in the image?",
+    "Does this image contain {object}?",
+    "Are there {object} in the image?",
+    "Is {object} in the image?",
+    "Does the image show {object}?",
+    "Is {object} shown in the image?",
+    "Can you find {object} in the image?",
+    "Is {object} there in the image?",
+    "Does this picture have {object}?",
+    "Is {object} present?",
+    "Can you spot {object}?",
+    "Is {object} detectable?",
+    "Does the photo contain {object}?",
+    "Are any {object} visible?",
+    "Is {object} apparent in the image?",
+    "Can you identify {object}?"
+  ]
+} 
