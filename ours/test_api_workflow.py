@@ -59,7 +59,6 @@ def test_api_workflow(base_url):
         setup_result = response.json()
         session_id = setup_result['session_id']
         print(f"✅ Renderer setup started, session ID: {session_id}")
-
         # Wait for renderer to be ready
         print("   Waiting for renderer to be ready...")
         for i in range(30):  # Wait up to 30 seconds
@@ -91,6 +90,7 @@ def test_api_workflow(base_url):
             "session_id": session_id,
             "scene_name": existing_scenes[0]
         }
+
 
         response = requests.post(
             f"{base_url}/set_scene",

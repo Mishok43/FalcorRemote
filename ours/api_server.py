@@ -25,6 +25,7 @@ global_renderer = None
 renderer_lock = threading.Lock()  # Ensure sequential access
 renderer_initialized = False
 
+
 # Global state
 active_sessions = {}  # session_id -> session info
 render_jobs = {}      # job_id -> job status
@@ -67,10 +68,13 @@ def initialize_global_renderer(render_width=512, render_height=512, use_nf_sampl
                 print("Setting up render graph...")
                 global_renderer.setup_render_graph()
 
+                print("Performing initial render sample to keep window alive...")
                 renderer_initialized = True
                 print("Global renderer initialized successfully with Cornell Box!")
                 print(f"Scene bounds: {global_renderer.scene_bounds}")
+                #time.sleep(100)
                 return True
+
 
             except Exception as e:
                 print(f"Failed to initialize global renderer: {e}")
@@ -80,6 +84,9 @@ def initialize_global_renderer(render_width=512, render_height=512, use_nf_sampl
         else:
             print("Global renderer already initialized")
             return True
+
+initialize_global_renderer(verbose=False)
+
 
 @app.route('/', methods=['GET'])
 def home():
@@ -119,6 +126,7 @@ def list_scenes():
         # Initialize global renderer if needed
         if not renderer_initialized:
             success = initialize_global_renderer(verbose=False)
+            time.sleep(100)
             if not success:
                 return jsonify({'error': 'Failed to initialize renderer'}), 500
 
