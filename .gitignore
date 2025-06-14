@@ -18,6 +18,7 @@
 
 # User files.
 /CMakeUserPresets.json
+ours/tmp_render/
 
 # File types.
 *.user
