@@ -1,0 +1,1223 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import numpy as np
+import argparse
+import shutil
+from pathlib import Path
+import json
+from typing import Tuple, List, Dict, Optional
+import datetime
+
+# Add the scripts directory to path for common module
+script_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(script_dir)
+sys.path.append(os.path.join(parent_dir, 'scripts', 'inv-rendering'))
+
+import torch
+import falcor
+from falcor import float3, uint2
+import common
+from surface_area_worker import SurfaceAreaCalculator
+from nf_sampler import NFSampler
+from predetermined_sampler import PredeterminedSampler
+
+# 3D visualization imports (optional)
+try:
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    print("Warning: 3D visualization libraries not available. Install matplotlib and plotly for 3D likelihood visualization.")
+
+
+class BasicRasterizer:
+    def __init__(self, render_width: int = 512, render_height: int = 512, verbose: bool = True,
+                 use_nf_sampler: bool = True, initial_samples: int = 100, train_batch_size: int = 50,
+                 predetermined_batch_size: int = 50, max_training_history: int = 2000,
+                 enable_3d_viz: bool = False, viz_every_n_steps: int = 50, viz_resolution: int = 20):
+        """
+        Initialize the basic rasterizer with NFSampler integration
+
+        Args:
+            render_width: Width of rendered images
+            render_height: Height of rendered images
+            verbose: Enable verbose output
+            use_nf_sampler: Whether to use NFSampler for adaptive sampling
+            initial_samples: Number of initial random samples before training
+            train_batch_size: Minimum samples needed before training NFSampler
+            predetermined_batch_size: Number of samples to pre-generate for efficiency
+            max_training_history: Maximum number of training samples to keep in memory
+            enable_3d_viz: Enable 3D likelihood visualization
+            viz_every_n_steps: Show 3D visualization every N training steps
+            viz_resolution: Resolution of 3D visualization grid (NxNxN)
+        """
+        self.render_width = render_width
+        self.render_height = render_height
+        self.verbose = verbose
+        self.use_nf_sampler = use_nf_sampler
+        self.initial_samples = initial_samples
+        self.train_batch_size = train_batch_size
+        self.predetermined_batch_size = predetermined_batch_size
+        self.max_training_history = max_training_history
+
+        # 3D visualization parameters
+        self.enable_3d_viz = enable_3d_viz and VISUALIZATION_AVAILABLE
+        self.viz_every_n_steps = viz_every_n_steps
+        self.viz_resolution = viz_resolution
+        self.viz_step_counter = 0
+
+        if self.enable_3d_viz and not VISUALIZATION_AVAILABLE:
+            print("Warning: 3D visualization requested but libraries not available. Disabling 3D visualization.")
+            self.enable_3d_viz = False
+
+        # Initialize Falcor components
+        self.testbed = None
+        self.scene = None
+        self.render_graph = None
+        self.device = None
+
+        # Keep alive flag to prevent garbage collection
+        self._keep_alive = False
+
+        # Scene management
+        self.current_scene_path = None
+        self.available_scenes = {}
+        self.scene_bounds = None
+
+        # Performance tracking
+        self.render_times = []
+        self.surface_areas = []
+
+        # Surface area calculator
+        self.surface_area_calculator = SurfaceAreaCalculator(
+            device='cuda' if torch.cuda.is_available() else 'cpu',
+            auto_pixel_area_threshold=True,
+            verbose=verbose
+        )
+
+        # NFSampler for adaptive sampling
+        self.nf_sampler = None
+        self.training_data = []  # Store (5D_input, surface_area) pairs
+        self.sample_count = 0
+        self.is_nf_trained = False
+
+        # PredeterminedSampler for batch efficiency
+        self.predetermined_sampler = None
+        self.samples_until_retrain = 0  # Counter to track when to retrain
+
+        if self.use_nf_sampler:
+            self.setup_nf_sampler()
+
+    def is_valid(self) -> bool:
+        """Check if the renderer is still valid and operational"""
+        return (self.testbed is not None and
+                hasattr(self, '_keep_alive') and
+                self._keep_alive)
+
+    def get_available_scenes(self) -> Dict[str, Dict]:
+        """Get list of available scenes"""
+        default_scenes = {
+            "cornell_box": {
+                "path": "D:/Models/CornellBox/cornell_box.pyscene",
+                "description": "Classic Cornell Box scene",
+                "exists": False
+            }
+
+        }
+
+
+
+
+        # Check which scenes actually exist
+        for scene_name, scene_info in default_scenes.items():
+            scene_info["exists"] = os.path.exists(scene_info["path"])
+
+        self.available_scenes = default_scenes
+        return self.available_scenes
+
+    def set_current_scene(self, scene_name: str) -> bool:
+        """Set the current scene by name"""
+        if not self.available_scenes:
+            self.get_available_scenes()
+
+        if scene_name not in self.available_scenes:
+            if self.verbose:
+                print(f"Scene '{scene_name}' not found in available scenes")
+            return False
+
+        scene_info = self.available_scenes[scene_name]
+        if not scene_info["exists"]:
+            if self.verbose:
+                print(f"Scene file does not exist: {scene_info['path']}")
+            return False
+
+        try:
+            self.load_scene(scene_info["path"])
+            if self.verbose:
+                print(f"Successfully set current scene to: {scene_name}")
+            return True
+        except Exception as e:
+            if self.verbose:
+                print(f"Failed to load scene '{scene_name}': {e}")
+            return False
+
+    def sample_render_positions(self, num_samples: int, nn_sampling: bool = False,
+                              return_albedo: bool = True) -> List[Dict]:
+        """
+        Sample X random positions and render, returning albedo + camera info
+
+        Args:
+            num_samples: Number of positions to sample
+            nn_sampling: Whether to use neural network sampling (if trained)
+            return_albedo: Whether to return albedo renders
+
+        Returns:
+            List of dictionaries containing render results
+        """
+        if self.scene is None:
+            raise RuntimeError("No scene loaded. Call set_current_scene() first.")
+
+        results = []
+
+        for i in range(num_samples):
+            if self.verbose:
+                print(f"Sampling position {i+1}/{num_samples}")
+
+            # Sample camera parameters
+            if nn_sampling and self.is_nf_trained:
+                camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_nf()
+                sampling_method = "neural_network"
+            else:
+                camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_random()
+                sampling_method = "random"
+
+            # Set camera
+            self.set_camera(camera_pos, camera_dir)
+
+            # Prepare camera info
+            camera_info = {
+                "sample_id": i,
+                "position": camera_pos.tolist(),
+                "direction": camera_dir.tolist(),
+                "target": (camera_pos + camera_dir).tolist(),
+                "input_5d": input_5d.tolist(),
+                "scene_bounds": {
+                    "min": self.scene_bounds[0].tolist(),
+                    "max": self.scene_bounds[1].tolist()
+                }
+            }
+
+            # Render frame
+            outputs, render_time = self.render_frame(camera_info)
+
+            # Prepare result
+            result = {
+                'sample_id': i,
+                'camera_position_absolute': camera_pos.tolist(),
+                'camera_direction_absolute': camera_dir.tolist(),
+                'camera_position_normalized': self.normalize_position(camera_pos).tolist(),
+                'camera_direction_normalized': self.direction_to_spherical(camera_dir).tolist(),
+                'surface_area': outputs.get('surface_area', 0.0),
+                'render_time': render_time,
+                'sampling_method': sampling_method,
+                'surface_area_stats': outputs.get('surface_area_stats', {})
+            }
+
+            # Add albedo render if requested
+            if return_albedo and 'diffuse' in outputs:
+                # Convert tensor to numpy and then to list for JSON serialization
+                albedo_array = outputs['diffuse'].cpu().numpy()
+                # Convert to uint8 for smaller size
+                albedo_uint8 = (np.clip(albedo_array, 0, 1) * 255).astype(np.uint8)
+                result['albedo_render'] = albedo_uint8.tolist()
+                result['albedo_shape'] = albedo_uint8.shape
+
+            results.append(result)
+
+        return results
+
+    def train_nf_sampler_steps(self, num_steps: int, **training_params) -> Dict:
+        """
+        Train the NFSampler for a specified number of steps with custom parameters
+
+        Args:
+            num_steps: Number of training steps to perform
+            **training_params: Additional training parameters to override defaults
+
+        Returns:
+            Dictionary with training results and statistics
+        """
+        if not self.use_nf_sampler:
+            return {"error": "NFSampler is disabled"}
+
+        if self.scene is None:
+            return {"error": "No scene loaded"}
+
+        # Update NFSampler parameters if provided
+        if training_params:
+            if 'learning_rate' in training_params:
+                self.nf_sampler.learning_rate = training_params['learning_rate']
+            if 'epochs_per_fit' in training_params:
+                self.nf_sampler.epochs_per_fit = training_params['epochs_per_fit']
+            if 'batch_size' in training_params:
+                self.nf_sampler.batch_size = training_params['batch_size']
+            if 'hidden_units' in training_params:
+                self.nf_sampler.hidden_units = training_params['hidden_units']
+            if 'hidden_layers' in training_params:
+                self.nf_sampler.hidden_layers = training_params['hidden_layers']
+
+        training_start_time = time.time()
+        initial_training_data_size = len(self.training_data)
+
+        # Collect training data by sampling
+        for step in range(num_steps):
+            if self.verbose and step % max(1, num_steps // 10) == 0:
+                print(f"Training step {step+1}/{num_steps}")
+
+            # Sample camera parameters
+            camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_random()
+
+            # Set camera and render
+            self.set_camera(camera_pos, camera_dir)
+
+            camera_info = {
+                "sample_id": step,
+                "position": camera_pos.tolist(),
+                "direction": camera_dir.tolist(),
+                "target": (camera_pos + camera_dir).tolist(),
+                "input_5d": input_5d.tolist(),
+                "scene_bounds": {
+                    "min": self.scene_bounds[0].tolist(),
+                    "max": self.scene_bounds[1].tolist()
+                }
+            }
+
+            outputs, render_time = self.render_frame(camera_info)
+            surface_area = outputs.get('surface_area', 0.0)
+
+            # Add to training data
+            self.add_training_data(input_5d, surface_area, sample_pdf)
+
+        training_end_time = time.time()
+        training_duration = training_end_time - training_start_time
+
+        # Final training statistics
+        final_training_data_size = len(self.training_data)
+        new_samples_added = final_training_data_size - initial_training_data_size
+
+        result = {
+            "training_completed": True,
+            "num_steps_requested": num_steps,
+            "num_samples_added": new_samples_added,
+            "total_training_samples": final_training_data_size,
+            "training_duration_seconds": training_duration,
+            "is_nf_trained": self.is_nf_trained,
+            "training_parameters_used": {
+                "learning_rate": getattr(self.nf_sampler, 'learning_rate', None),
+                "epochs_per_fit": getattr(self.nf_sampler, 'epochs_per_fit', None),
+                "batch_size": getattr(self.nf_sampler, 'batch_size', None),
+                "hidden_units": getattr(self.nf_sampler, 'hidden_units', None),
+                "hidden_layers": getattr(self.nf_sampler, 'hidden_layers', None)
+            }
+        }
+
+        if self.verbose:
+            print(f"Training completed: {new_samples_added} new samples in {training_duration:.2f}s")
+            print(f"NFSampler trained: {self.is_nf_trained}")
+
+        return result
+
+    def setup_nf_sampler(self):
+        """Initialize the 5D NFSampler"""
+        if self.verbose:
+            print("Setting up 5D NFSampler (3D position + 2D spherical direction)")
+
+        self.nf_sampler = NFSampler(
+            name="camera_sampler",
+            rng=None,
+            num_flows=4,
+            hidden_units=128,
+            hidden_layers=2,
+            learning_rate=1e-3,
+            epochs_per_fit=25,
+            batch_size=64,
+            history_size=1000,
+            latent_size=5,  # 5D: 3 for position + 2 for spherical direction
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+
+        # Register 5 dimensions with the sampler
+        for i in range(5):
+            self.nf_sampler.register_dimension()
+
+        self.nf_sampler.reinitialize()
+
+    def normalize_position(self, position: np.ndarray) -> np.ndarray:
+        """Convert absolute position to normalized [0,1] based on scene bounds"""
+        min_bounds, max_bounds = self.scene_bounds
+        bounds_size = max_bounds - min_bounds
+
+        # Add small epsilon to avoid division by zero
+        bounds_size = np.maximum(bounds_size, 1e-6)
+
+        normalized = (position - min_bounds) / bounds_size
+        return np.clip(normalized, 0.0, 1.0)
+
+    def denormalize_position(self, normalized_pos: np.ndarray) -> np.ndarray:
+        """Convert normalized [0,1] position back to absolute coordinates"""
+        min_bounds, max_bounds = self.scene_bounds
+        bounds_size = max_bounds - min_bounds
+
+        # Add margin for better camera placement
+        margin_factor = 0.2
+        margin = bounds_size * margin_factor
+        extended_min = min_bounds - margin
+        extended_max = max_bounds + margin
+        extended_size = extended_max - extended_min
+
+        absolute_pos = extended_min + normalized_pos * extended_size
+        return absolute_pos
+
+    def direction_to_spherical(self, direction: np.ndarray) -> np.ndarray:
+        """Convert 3D direction vector to 2D spherical coordinates [0,1]"""
+        # Normalize direction
+        direction = direction / np.linalg.norm(direction)
+
+        # Convert to spherical coordinates
+        theta = np.arctan2(direction[1], direction[0])  # azimuth [-pi, pi]
+        phi = np.arccos(np.clip(direction[2], -1, 1))    # polar [0, pi]
+
+        # Normalize to [0,1]
+        theta_norm = (theta + np.pi) / (2 * np.pi)  # [0,1]
+        phi_norm = phi / np.pi                       # [0,1]
+
+        return np.array([theta_norm, phi_norm])
+
+    def spherical_to_direction(self, spherical: np.ndarray) -> np.ndarray:
+        """Convert 2D spherical coordinates [0,1] back to 3D direction vector"""
+        theta_norm, phi_norm = spherical
+
+        # Convert back to spherical coordinates
+        theta = theta_norm * 2 * np.pi - np.pi  # [-pi, pi]
+        phi = phi_norm * np.pi                  # [0, pi]
+
+        # Convert to Cartesian coordinates
+        x = np.sin(phi) * np.cos(theta)
+        y = np.sin(phi) * np.sin(theta)
+        z = np.cos(phi)
+
+        direction = np.array([x, y, z])
+        return direction / np.linalg.norm(direction)  # Normalize
+
+    def setup_falcor(self):
+        """Initialize Falcor testbed and device"""
+        if self.verbose:
+            print(f"Setting up Falcor with resolution {self.render_width}x{self.render_height}")
+
+        self.testbed = common.create_testbed([self.render_width, self.render_height])
+        self.device = self.testbed.device
+        self._keep_alive = True  # Mark as active to prevent garbage collection
+
+    def load_scene(self, scene_path: str):
+        """Load a scene file"""
+        if self.verbose:
+            print(f"Loading scene: {scene_path}")
+
+        if not os.path.exists(scene_path):
+            raise FileNotFoundError(f"Scene file not found: {scene_path}")
+
+        scene_path = Path(scene_path)
+        self.scene = common.load_scene(
+            self.testbed,
+            scene_path,
+            self.render_width / self.render_height
+        )
+
+        # Calculate scene bounding box
+        self.scene_bounds = self._calculate_scene_bounds()
+
+        if self.verbose:
+            print(f"Scene bounds: min={self.scene_bounds[0]}, max={self.scene_bounds[1]}")
+
+    def _calculate_scene_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Calculate the bounding box of the scene"""
+        # Get scene bounds from Falcor
+        if hasattr(self.scene, 'bounds'):
+            bounds = self.scene.bounds
+            min_bounds = np.array([bounds.minPoint.x, bounds.minPoint.y, bounds.minPoint.z])
+            max_bounds = np.array([bounds.maxPoint.x, bounds.maxPoint.y, bounds.maxPoint.z])
+        else:
+            # Default bounds if not available
+            min_bounds = np.array([-5.0, -5.0, -5.0])
+            max_bounds = np.array([5.0, 5.0, 5.0])
+
+        return min_bounds, max_bounds
+
+    def setup_render_graph(self):
+        """Setup the rasterization render graph"""
+        if self.verbose:
+            print("Setting up rasterization render graph")
+
+        # Create render graph for basic rasterization
+        self.render_graph = self.testbed.create_render_graph("BasicRasterizer")
+
+        # Use GBufferRaster for rasterization (not ray tracing)
+        # Disable culling to capture both front and back faces for signed surface area
+        gbuffer_pass = self.render_graph.create_pass(
+            "GBufferRaster",
+            "GBufferRaster",
+            {
+                "samplePattern": "Center",
+                "sampleCount": 1,
+                "useAlphaTest": True,
+                "forceCullMode": True,  # Force override of default cull mode
+                "cull": "None"          # Disable culling to see both front and back faces
+            }
+        )
+
+        # Mark outputs we want to capture
+        self.render_graph.mark_output("GBufferRaster.diffuseOpacity")  # Diffuse
+        self.render_graph.mark_output("GBufferRaster.depth")  # Depth
+        self.render_graph.mark_output("GBufferRaster.linearZ")  # Linear Z and derivatives
+        self.render_graph.mark_output("GBufferRaster.guideNormalW")  # World space normals for back-face detection
+
+        # Assign render graph to testbed
+        self.testbed.render_graph = self.render_graph
+
+    def sample_camera_params_random(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Sample random camera parameters and return (position, direction, 5D_input, pdf)"""
+        # Sample random position
+        min_bounds, max_bounds = self.scene_bounds
+        bounds_size = max_bounds - min_bounds
+        margin_factor = 0.2
+        margin = bounds_size * margin_factor
+        extended_min = min_bounds - margin
+        extended_max = max_bounds + margin
+        extended_size = extended_max - extended_min
+
+        position = np.random.uniform(extended_min, extended_max)
+
+        # Calculate PDF for position (uniform over extended volume)
+        position_pdf = 1.0 / np.prod(extended_size)
+
+        # Sample random direction on sphere using uniform sampling
+        u1 = np.random.uniform(0, 1)
+        u2 = np.random.uniform(0, 1)
+        theta = 2 * np.pi * u1
+        phi = np.arccos(2 * u2 - 1)
+
+        x = np.sin(phi) * np.cos(theta)
+        y = np.sin(phi) * np.sin(theta)
+        z = np.cos(phi)
+        direction = np.array([x, y, z])
+        direction = direction / np.linalg.norm(direction)
+
+        # Calculate PDF for direction (uniform on unit sphere)
+        # Surface area of unit sphere is 4π, so PDF = 1/(4π)
+        direction_pdf = 1.0 / (4.0 * np.pi)
+
+        # Combined PDF (assuming independence)
+        combined_pdf = position_pdf * direction_pdf
+
+        # Convert to 5D input for NFSampler
+        normalized_pos = self.normalize_position(position)
+        spherical_dir = self.direction_to_spherical(direction)
+        input_5d = np.concatenate([normalized_pos, spherical_dir])
+
+        return position, direction, input_5d, combined_pdf
+
+    def sample_camera_params_nf(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Sample camera parameters using NFSampler"""
+        if not self.is_nf_trained:
+            return self.sample_camera_params_random()
+
+        # Sample from NFSampler
+        sample = self.nf_sampler.sample_primary(num_samples=1)[0]
+        input_5d = np.array(sample.value)
+        pdf = sample.pdf
+
+        # Convert 5D input back to position and direction
+        normalized_pos = input_5d[:3]
+        spherical_dir = input_5d[3:5]
+
+        position = self.denormalize_position(normalized_pos)
+        direction = self.spherical_to_direction(spherical_dir)
+
+        return position, direction, input_5d, pdf
+
+    def set_camera(self, position: np.ndarray, direction: np.ndarray):
+        """Set camera position and direction"""
+        # Calculate target point
+        target = position + direction
+
+        # Set camera parameters
+        self.scene.camera.position = float3(position[0], position[1], position[2])
+        self.scene.camera.target = float3(target[0], target[1], target[2])
+        self.scene.camera.up = float3(0, 1, 0)  # Standard up vector
+
+    def depth_to_world_coordinates(self, depth_tensor, camera_info):
+        """Convert depth buffer to world coordinates using camera parameters"""
+        try:
+            h, w = depth_tensor.shape
+            device = depth_tensor.device
+
+            # Extract camera parameters
+            camera_pos = torch.tensor(camera_info['position'], device=device, dtype=torch.float32)
+            camera_dir = torch.tensor(camera_info['direction'], device=device, dtype=torch.float32)
+
+            # Create coordinate grids
+            y_coords, x_coords = torch.meshgrid(
+                torch.arange(h, device=device, dtype=torch.float32),
+                torch.arange(w, device=device, dtype=torch.float32),
+                indexing='ij'
+            )
+
+            # Convert to normalized device coordinates
+            x_ndc = (x_coords - w/2) / (w/2)
+            y_ndc = (y_coords - h/2) / (h/2)
+
+            # Estimate focal length based on typical camera setup
+            focal_length_px = min(w, h) * 0.8  # Rough estimate
+
+            # Calculate camera rays
+            ray_x = x_ndc / focal_length_px * w
+            ray_y = -y_ndc / focal_length_px * h
+            ray_z = -torch.ones_like(ray_x)
+
+            # Normalize ray direction
+            ray_dir = torch.stack([ray_x, ray_y, ray_z], dim=-1)
+            ray_dir = ray_dir / torch.norm(ray_dir, dim=-1, keepdim=True)
+
+            # Calculate world coordinates
+            world_coords = camera_pos.unsqueeze(0).unsqueeze(0) + ray_dir * depth_tensor.unsqueeze(-1)
+
+            # Create valid mask
+            valid_mask = (depth_tensor > 0.001) & (depth_tensor < 0.999)
+
+            return world_coords, valid_mask
+
+        except Exception as e:
+            print(f"Error in depth to world conversion: {e}")
+            return None, None
+
+    def render_frame(self, camera_info: dict) -> dict:
+        """Render a single frame and return the output buffers with surface area estimation"""
+        start_time = time.time()
+
+        # Execute rendering
+        self.testbed.frame()
+
+        # Get outputs and convert to PyTorch via numpy
+        outputs = {}
+
+        # Get diffuse buffer - keep on CPU to save GPU memory
+        diffuse_buffer = self.render_graph.get_output("GBufferRaster.diffuseOpacity")
+        if diffuse_buffer is not None:
+            diffuse_numpy = diffuse_buffer.to_numpy()[:, :, :3]  # RGB only
+            # Keep on CPU to save GPU memory
+            outputs['diffuse'] = torch.from_numpy(diffuse_numpy)
+
+        # Get depth buffer - temporarily move to GPU for processing, then back to CPU
+        depth_buffer = self.render_graph.get_output("GBufferRaster.depth")
+        depth_tensor_gpu = None
+        if depth_buffer is not None:
+            depth_numpy = depth_buffer.to_numpy()
+            if torch.cuda.is_available():
+                depth_tensor_gpu = torch.from_numpy(depth_numpy).cuda()
+            else:
+                depth_tensor_gpu = torch.from_numpy(depth_numpy)
+            # Store CPU version to save memory
+            outputs['depth'] = torch.from_numpy(depth_numpy)
+
+        # Get linear Z buffer - keep on CPU
+        linear_z_buffer = self.render_graph.get_output("GBufferRaster.linearZ")
+        if linear_z_buffer is not None:
+            linear_z_numpy = linear_z_buffer.to_numpy()
+            outputs['linear_z'] = torch.from_numpy(linear_z_numpy)
+
+        # Get normal buffer for back-face detection - temporarily move to GPU for processing
+        normal_buffer = self.render_graph.get_output("GBufferRaster.guideNormalW")
+        normal_tensor_gpu = None
+        if normal_buffer is not None:
+            normal_numpy = normal_buffer.to_numpy()[:, :, :3]  # Only XYZ components
+            if torch.cuda.is_available():
+                normal_tensor_gpu = torch.from_numpy(normal_numpy).cuda()
+            else:
+                normal_tensor_gpu = torch.from_numpy(normal_numpy)
+            # Store CPU version to save memory
+            outputs['normals'] = torch.from_numpy(normal_numpy)
+
+        # Calculate surface area using depth buffer
+        surface_area = 0.0
+        surface_area_stats = {}
+
+        if depth_tensor_gpu is not None:
+            try:
+                # Convert depth to world coordinates (using GPU tensor for processing)
+                world_coords, valid_mask = self.depth_to_world_coordinates(depth_tensor_gpu, camera_info)
+
+                if world_coords is not None and valid_mask is not None:
+                    # Estimate surface area using the surface area calculator with signed area
+                    surface_area, surface_area_stats, final_valid_mask = self.surface_area_calculator.estimate_surface_area_signed(
+                        world_coords, valid_mask, normal_tensor_gpu, camera_info
+                    )
+
+                    # Don't store the final_valid_mask to save memory
+                    # outputs['valid_mask'] = final_valid_mask
+
+                    if self.verbose:
+                        print(f"    Signed surface area: {surface_area:.6f}")
+                        if surface_area_stats:
+                            print(f"    Pixels after filtering: {surface_area_stats.get('pixels_after_area_filter', 0)}")
+                            print(f"    Filter ratio: {surface_area_stats.get('area_filter_ratio', 0.0):.3f}")
+                            print(f"    Front-facing ratio: {surface_area_stats.get('front_facing_ratio', 0.0):.3f}")
+                            front_pixels = surface_area_stats.get('front_facing_pixels', 0)
+                            back_pixels = surface_area_stats.get('back_facing_pixels', 0)
+                            print(f"    Front-facing pixels: {front_pixels}, Back-facing pixels: {back_pixels}")
+
+                # Clean up GPU tensors immediately
+                del world_coords, valid_mask
+                if 'final_valid_mask' in locals():
+                    del final_valid_mask
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+            except Exception as e:
+                print(f"Error calculating surface area: {e}")
+                surface_area = 0.0
+
+        # Clean up GPU tensors
+        if depth_tensor_gpu is not None:
+            del depth_tensor_gpu
+        if normal_tensor_gpu is not None:
+            del normal_tensor_gpu
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Track timing and surface area
+        render_time = time.time() - start_time
+        self.render_times.append(render_time)
+        self.surface_areas.append(surface_area)
+
+        # Add surface area info to outputs (scalars only, no tensors)
+        outputs['surface_area'] = surface_area
+        outputs['surface_area_stats'] = surface_area_stats
+
+        return outputs, render_time
+
+    def add_training_data(self, input_5d: np.ndarray, surface_area: float, sample_pdf: float):
+        """Add training data to NFSampler"""
+        if not self.use_nf_sampler:
+            return
+
+        self.training_data.append((input_5d.tolist(), surface_area, sample_pdf))
+
+        # Limit training data history to prevent memory accumulation
+        if len(self.training_data) > self.max_training_history:
+            self.training_data = self.training_data[-self.max_training_history:]
+
+        # Decrement samples until retrain
+        if self.samples_until_retrain > 0:
+            self.samples_until_retrain -= 1
+
+        # Train when we have enough data and every 50 samples after that
+        if len(self.training_data) >= self.train_batch_size and (
+            not self.is_nf_trained or self.samples_until_retrain == 0
+        ):
+            self.train_nf_sampler()
+            # Generate next batch of predetermined samples
+            self.generate_predetermined_samples()
+
+    def train_nf_sampler(self):
+        """Train the NFSampler with accumulated data"""
+        if not self.use_nf_sampler or len(self.training_data) < self.train_batch_size:
+            return
+
+        if self.verbose:
+            print(f"\nTraining NFSampler with {len(self.training_data)} samples...")
+
+        # Prepare training data
+        x_data = [data[0] for data in self.training_data]  # 5D inputs
+        y_data = [data[1] for data in self.training_data]  # Surface areas
+        x_pdf_data = [data[2] for data in self.training_data]  # Actual PDF values used for sampling
+
+        # Add data to NFSampler (note: NFSampler wants to minimize y, but we want to maximize surface area)
+        # So we use negative surface area as the loss
+
+        try:
+            self.nf_sampler.add_data(x_data, x_pdf_data, y_data)
+            self.nf_sampler.fit()
+            self.is_nf_trained = True
+
+            if self.verbose:
+                print(f"NFSampler training complete. Model is now active for sampling.")
+
+            # Show 3D visualization if enabled and it's time
+            if self.should_show_3d_viz():
+                if self.verbose:
+                    print("Generating 3D likelihood visualization...")
+                self.visualize_3d_likelihood(len(self.training_data))
+
+            # Clean up GPU memory after training
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"Error training NFSampler: {e}")
+            # Clean up GPU memory even on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def generate_predetermined_samples(self, batch_size: int = None):
+        """Generate a batch of predetermined samples from NFSampler for efficiency"""
+        if not self.is_nf_trained:
+            return
+
+        if batch_size is None:
+            batch_size = self.predetermined_batch_size
+
+        try:
+            # Generate batch of samples from NFSampler
+            nf_samples = self.nf_sampler.sample_primary(num_samples=batch_size)
+
+            # Create PredeterminedSampler from these samples
+            self.predetermined_sampler = PredeterminedSampler.from_samples(nf_samples)
+
+            # Set samples until retrain counter
+            self.samples_until_retrain = batch_size
+
+            if self.verbose:
+                print(f"Generated {batch_size} predetermined samples from NFSampler")
+
+        except Exception as e:
+            print(f"Error generating predetermined samples: {e}")
+            self.predetermined_sampler = None
+
+    def sample_camera_params_predetermined(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Sample camera parameters from predetermined samples (batch efficient)"""
+        if self.predetermined_sampler is None or self.predetermined_sampler.remaining_samples() == 0:
+            # Fall back to regular NF sampling
+            return self.sample_camera_params_nf()
+
+        try:
+            # Get PDF for current sample
+            pdf = self.predetermined_sampler.sample()
+
+            # Get 5D input values
+            pos_norm = np.array([
+                self.predetermined_sampler.get(),  # x
+                self.predetermined_sampler.get(),  # y
+                self.predetermined_sampler.get()   # z
+            ])
+
+            spherical = np.array([
+                self.predetermined_sampler.get(),  # theta
+                self.predetermined_sampler.get()   # phi
+            ])
+
+            # Convert to world coordinates
+            camera_pos = self.denormalize_position(pos_norm)
+            camera_dir = self.spherical_to_direction(spherical)
+
+            # Create 5D input vector for training
+            input_5d = np.concatenate([pos_norm, spherical])
+
+            return camera_pos, camera_dir, input_5d, pdf
+
+        except Exception as e:
+            print(f"Error in predetermined sampling: {e}")
+            # Fall back to regular NF sampling
+            return self.sample_camera_params_nf()
+
+    def render_samples(self, num_samples: int):
+        """Render multiple samples with adaptive camera sampling"""
+        if self.verbose:
+            print(f"Starting adaptive render of {num_samples} samples")
+            if self.use_nf_sampler:
+                print(f"NFSampler will be used after {self.train_batch_size} samples")
+
+        results = []
+
+        for sample_id in range(num_samples):
+            if self.verbose:
+                # Determine sampling method before sampling
+                if self.use_nf_sampler and self.is_nf_trained:
+                    if self.predetermined_sampler and self.predetermined_sampler.remaining_samples() > 0:
+                        method_preview = "NF-batch"
+                    else:
+                        method_preview = "NF-guided"
+                else:
+                    method_preview = "Random"
+                print(f"Rendering sample {sample_id + 1}/{num_samples} ({method_preview})")
+
+            # Sample camera parameters (adaptive or random)
+            if self.use_nf_sampler and self.is_nf_trained:
+                # Use predetermined samples for efficiency if available
+                if self.predetermined_sampler and self.predetermined_sampler.remaining_samples() > 0:
+                    camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_predetermined()
+                    sampling_method = "NF-batch"
+                else:
+                    camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_nf()
+                    sampling_method = "NF-guided"
+            else:
+                camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_random()
+                sampling_method = "Random"
+
+            # Set camera
+            self.set_camera(camera_pos, camera_dir)
+
+            # Prepare camera info for surface area calculation
+            camera_info = {
+                "sample_id": sample_id,
+                "position": camera_pos.tolist(),
+                "direction": camera_dir.tolist(),
+                "target": (camera_pos + camera_dir).tolist(),
+                "input_5d": input_5d.tolist(),
+                "scene_bounds": {
+                    "min": self.scene_bounds[0].tolist(),
+                    "max": self.scene_bounds[1].tolist()
+                }
+            }
+
+            # Render frame with surface area calculation
+            outputs, render_time = self.render_frame(camera_info)
+            surface_area = outputs.get('surface_area', 0.0)
+
+            # Add training data to NFSampler
+            self.add_training_data(input_5d, surface_area, sample_pdf)
+
+            # Store results - only keep essential data, not large tensors
+            result = {
+                'sample_id': sample_id,
+                'camera_info': camera_info,
+                'render_time': render_time,
+                'surface_area': surface_area,
+                'surface_area_stats': outputs.get('surface_area_stats', {}),
+                'sampling_method': sampling_method
+                # Note: Not storing 'outputs' to save memory - it contains large tensors
+            }
+
+            results.append(result)
+
+            # Periodic memory cleanup every 10 samples
+            if (sample_id + 1) % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if self.verbose:
+                print(f"  Render time: {render_time:.3f}s")
+                print(f"  Surface area: {surface_area:.6f}")
+                if self.use_nf_sampler:
+                    print(f"  Training data: {len(self.training_data)}/{self.train_batch_size}")
+                    if self.predetermined_sampler:
+                        print(f"  Predetermined samples remaining: {self.predetermined_sampler.remaining_samples()}")
+                # Show GPU memory usage if available
+                if torch.cuda.is_available() and (sample_id + 1) % 20 == 0:
+                    memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                    memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                    print(f"  GPU Memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
+
+        self._print_performance_stats()
+        return results
+
+    def _print_performance_stats(self):
+        """Print performance statistics"""
+        if len(self.render_times) > 0:
+            avg_time = np.mean(self.render_times)
+            min_time = np.min(self.render_times)
+            max_time = np.max(self.render_times)
+            total_time = np.sum(self.render_times)
+
+            print(f"\nPerformance Statistics:")
+            print(f"  Total samples: {len(self.render_times)}")
+            print(f"  Total time: {total_time:.3f}s")
+            print(f"  Average time per sample: {avg_time:.3f}s")
+            print(f"  Min time: {min_time:.3f}s")
+            print(f"  Max time: {max_time:.3f}s")
+            print(f"  Samples per second: {len(self.render_times) / total_time:.2f}")
+
+        if len(self.surface_areas) > 0:
+            avg_area = np.mean(self.surface_areas)
+            min_area = np.min(self.surface_areas)
+            max_area = np.max(self.surface_areas)
+            total_area = np.sum(self.surface_areas)
+
+            # Calculate absolute area statistics for comparison
+            abs_areas = [abs(area) for area in self.surface_areas]
+            avg_abs_area = np.mean(abs_areas)
+            total_abs_area = np.sum(abs_areas)
+
+            print(f"\nSigned Surface Area Statistics:")
+            print(f"  Average signed surface area: {avg_area:.6f}")
+            print(f"  Min signed surface area: {min_area:.6f}")
+            print(f"  Max signed surface area: {max_area:.6f}")
+            print(f"  Total signed surface area: {total_area:.6f}")
+            print(f"  Average absolute surface area: {avg_abs_area:.6f}")
+            print(f"  Total absolute surface area: {total_abs_area:.6f}")
+
+            if self.use_nf_sampler:
+                random_samples = [r for r in self.surface_areas[:self.train_batch_size]]
+                nf_samples = [r for r in self.surface_areas[self.train_batch_size:]]
+
+                if len(random_samples) > 0 and len(nf_samples) > 0:
+                    print(f"\nAdaptive Sampling Analysis:")
+                    print(f"  Random sampling avg: {np.mean(random_samples):.6f}")
+                    print(f"  NF-guided sampling avg: {np.mean(nf_samples):.6f}")
+                    improvement = (np.mean(nf_samples) - np.mean(random_samples)) / abs(np.mean(random_samples)) * 100
+                    print(f"  Improvement: {improvement:.1f}%")
+
+                    # Also show absolute area improvement
+                    random_abs = [abs(r) for r in random_samples]
+                    nf_abs = [abs(r) for r in nf_samples]
+                    abs_improvement = (np.mean(nf_abs) - np.mean(random_abs)) / np.mean(random_abs) * 100
+                    print(f"  Absolute area improvement: {abs_improvement:.1f}%")
+
+    def sample_3d_likelihood_grid(self, resolution: int = 20, directions_per_point: int = 100):
+        """
+        Sample likelihood values on a 3D grid for visualization
+
+        Args:
+            resolution: Grid resolution (NxNxN)
+            directions_per_point: Number of random directions to sample per grid point
+
+        Returns:
+            tuple: (grid_positions, likelihood_values)
+        """
+        if not self.is_nf_trained:
+            return None, None
+
+        if self.verbose:
+            print(f"Sampling 3D likelihood grid ({resolution}^3 = {resolution**3} points, {directions_per_point} directions each)")
+
+        # Create 3D grid of positions in normalized space [0,1]^3
+        x = np.linspace(0, 1, resolution)
+        y = np.linspace(0, 1, resolution)
+        z = np.linspace(0, 1, resolution)
+
+        grid_positions = []
+        likelihood_values = []
+
+        total_points = resolution ** 3
+        processed = 0
+
+        for i in range(resolution):
+            for j in range(resolution):
+                for k in range(resolution):
+                    pos_norm = np.array([x[i], y[j], z[k]])
+
+                    # Sample multiple random directions for this position
+                    direction_likelihoods = []
+
+                    for _ in range(directions_per_point):
+                        # Sample random direction on unit sphere
+                        u1 = np.random.uniform(0, 1)
+                        u2 = np.random.uniform(0, 1)
+                        theta = 2 * np.pi * u1
+                        phi = np.arccos(2 * u2 - 1)
+
+                        # Convert to spherical coordinates [0,1]^2
+                        theta_norm = (theta + np.pi) / (2 * np.pi)
+                        phi_norm = phi / np.pi
+                        spherical_dir = np.array([theta_norm, phi_norm])
+
+                        # Create 5D input
+                        input_5d = np.concatenate([pos_norm, spherical_dir])
+
+                        try:
+                            # Get likelihood from NFSampler
+                            likelihood = self.nf_sampler.get_likelihood(input_5d.tolist())
+                            direction_likelihoods.append(likelihood)
+                        except Exception as e:
+                            # If likelihood calculation fails, use 0
+                            direction_likelihoods.append(0.0)
+
+                    # Average likelihood across all directions for this position
+                    avg_likelihood = np.mean(direction_likelihoods) if direction_likelihoods else 0.0
+
+                    # Convert normalized position to world coordinates for visualization
+                    world_pos = self.denormalize_position(pos_norm)
+
+                    grid_positions.append(world_pos)
+                    likelihood_values.append(avg_likelihood)
+
+                    processed += 1
+                    if self.verbose and processed % (total_points // 10) == 0:
+                        print(f"  Progress: {processed}/{total_points} ({100*processed/total_points:.1f}%)")
+
+        return np.array(grid_positions), np.array(likelihood_values)
+
+    def visualize_3d_likelihood(self, step: int):
+        """
+        Create and display 3D likelihood visualization
+
+        Args:
+            step: Current training step for title
+        """
+        if not self.enable_3d_viz or not self.is_nf_trained:
+            return
+
+        try:
+            # Sample likelihood grid
+            positions, likelihoods = self.sample_3d_likelihood_grid(
+                resolution=self.viz_resolution,
+                directions_per_point=50  # Reduced for faster computation
+            )
+
+            if positions is None or likelihoods is None:
+                return
+
+            # Normalize likelihoods for better visualization
+            if np.max(likelihoods) > np.min(likelihoods):
+                likelihoods_norm = (likelihoods - np.min(likelihoods)) / (np.max(likelihoods) - np.min(likelihoods))
+            else:
+                likelihoods_norm = likelihoods
+
+            # Create 3D scatter plot with Plotly
+            fig = go.Figure(data=go.Scatter3d(
+                x=positions[:, 0],
+                y=positions[:, 1],
+                z=positions[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=3,
+                    color=likelihoods_norm,
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="Normalized Likelihood"),
+                    cmin=0,
+                    cmax=1
+                ),
+                text=[f'Pos: ({x:.2f}, {y:.2f}, {z:.2f})<br>Likelihood: {l:.4f}'
+                      for (x, y, z), l in zip(positions, likelihoods)],
+                hovertemplate='%{text}<extra></extra>'
+            ))
+
+            # Add scene bounds visualization
+            min_bounds, max_bounds = self.scene_bounds
+
+            # Create wireframe box for scene bounds
+            box_x = [min_bounds[0], max_bounds[0], max_bounds[0], min_bounds[0], min_bounds[0],
+                     min_bounds[0], max_bounds[0], max_bounds[0], min_bounds[0], min_bounds[0],
+                     max_bounds[0], max_bounds[0], min_bounds[0], min_bounds[0], max_bounds[0], max_bounds[0]]
+            box_y = [min_bounds[1], min_bounds[1], max_bounds[1], max_bounds[1], min_bounds[1],
+                     min_bounds[1], min_bounds[1], max_bounds[1], max_bounds[1], min_bounds[1],
+                     min_bounds[1], max_bounds[1], max_bounds[1], min_bounds[1], min_bounds[1], max_bounds[1]]
+            box_z = [min_bounds[2], min_bounds[2], min_bounds[2], min_bounds[2], min_bounds[2],
+                     max_bounds[2], max_bounds[2], max_bounds[2], max_bounds[2], max_bounds[2],
+                     min_bounds[2], min_bounds[2], max_bounds[2], max_bounds[2], max_bounds[2], max_bounds[2]]
+
+            fig.add_trace(go.Scatter3d(
+                x=box_x, y=box_y, z=box_z,
+                mode='lines',
+                line=dict(color='red', width=2),
+                name='Scene Bounds',
+                showlegend=True
+            ))
+
+            fig.update_layout(
+                title=f'3D Likelihood Visualization - Training Step {step}<br>Higher likelihood = Better camera positions',
+                scene=dict(
+                    xaxis_title='X',
+                    yaxis_title='Y',
+                    zaxis_title='Z',
+                    aspectmode='cube'
+                ),
+                width=800,
+                height=600
+            )
+
+            # Show the plot
+            fig.show()
+
+            if self.verbose:
+                print(f"3D likelihood visualization displayed for step {step}")
+                print(f"Likelihood range: {np.min(likelihoods):.6f} to {np.max(likelihoods):.6f}")
+
+        except Exception as e:
+            print(f"Error creating 3D visualization: {e}")
+
+    def should_show_3d_viz(self) -> bool:
+        """Check if we should show 3D visualization at this step"""
+        if not self.enable_3d_viz or not self.is_nf_trained:
+            return False
+
+        self.viz_step_counter += 1
+        return self.viz_step_counter % self.viz_every_n_steps == 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Basic Falcor Rasterizer with NFSampler for Adaptive Camera Sampling")
+    parser.add_argument("--scene-file",  default="D:/Models/CornellBox/cornell_box.pyscene", help="Path to scene file (.pyscene, .fbx, .gltf, etc.)")
+    parser.add_argument("--num_samples", type=int, default=2000, help="Number of samples to render")
+    parser.add_argument("--width", type=int, default=512, help="Render width")
+    parser.add_argument("--height", type=int, default=512, help="Render height")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    parser.add_argument("--no_nf", action="store_true", help="Disable NFSampler (use random sampling only)")
+    parser.add_argument("--train_batch_size", type=int, default=100, help="Minimum samples before training NFSampler")
+    parser.add_argument("--predetermined_batch_size", type=int, default=50, help="Number of samples to pre-generate from NFSampler for efficiency")
+    parser.add_argument("--max_training_history", type=int, default=2000, help="Maximum number of training samples to keep in memory")
+    parser.add_argument("--enable_3d_viz", action="store_true", help="Enable 3D likelihood visualization")
+    parser.add_argument("--viz_every_n_steps", type=int, default=200, help="Show 3D visualization every N training steps")
+    parser.add_argument("--viz_resolution", type=int, default=25, help="Resolution of 3D visualization grid (NxNxN)")
+
+    args = parser.parse_args()
+
+    # Set random seed if provided
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+    # Create renderer
+    renderer = BasicRasterizer(
+        render_width=args.width,
+        render_height=args.height,
+        verbose=args.verbose,
+        use_nf_sampler=not args.no_nf,
+        train_batch_size=args.train_batch_size,
+        predetermined_batch_size=args.predetermined_batch_size,
+        max_training_history=args.max_training_history,
+        enable_3d_viz=args.enable_3d_viz,
+        viz_every_n_steps=args.viz_every_n_steps,
+        viz_resolution=args.viz_resolution
+    )
+
+    try:
+        # Setup Falcor
+        renderer.setup_falcor()
+
+        # Load scene
+        renderer.load_scene(args.scene_file)
+
+        # Setup render graph
+        renderer.setup_render_graph()
+
+        # Render samples with adaptive sampling
+        results = renderer.render_samples(args.num_samples)
+
+        print("Rendering complete!")
+        print(f"Rendered {len(results)} samples with adaptive camera sampling")
+
+        if renderer.use_nf_sampler and renderer.is_nf_trained:
+            print("NFSampler was successfully trained and used for adaptive sampling")
+
+        # Optional: return results for further processing
+        return results
+
+    except Exception as e:
+        print(f"Error during rendering: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    return 0
+
+
+if __name__ == "__main__":
+    results = main()
+    if results is not None:
+        print(f"Results contain {len(results)} samples with adaptive camera sampling and surface area data")
