@@ -12,7 +12,7 @@ from PIL import Image
 import io
 
 # API base URL
-BASE_URL = "http://localhost:5000"
+BASE_URL = "https://817a-37-16-65-130.ngrok-free.app/"
 
 class AdaptiveCameraSamplingClient:
     def __init__(self, base_url="http://localhost:5000"):
@@ -22,6 +22,7 @@ class AdaptiveCameraSamplingClient:
     def get_api_info(self):
         """Get API information and available endpoints"""
         response = requests.get(f"{self.base_url}/")
+        print(response)
         return response.json()
 
     def get_available_scenes(self):
@@ -218,7 +219,7 @@ class AdaptiveCameraSamplingClient:
 
 def main():
     """Example usage of the new API features"""
-    client = AdaptiveCameraSamplingClient()
+    client = AdaptiveCameraSamplingClient(base_url=BASE_URL)
 
     try:
         # 1. Get API info
@@ -273,14 +274,16 @@ def main():
         # 5. Sample render with random sampling
         print("\n=== Sample Render (Random Sampling) ===")
         random_results = client.sample_render(
-            num_samples=5,
-            nn_sampling=False,
+            num_samples=10,
+            nn_sampling=True,
             return_albedo=True
         )
 
         if random_results and 'results' in random_results:
             results = random_results['results']
             print(f"Random sampling completed: {len(results)} samples")
+
+            print('results', results[0])
 
             # Save first albedo image
             if results and 'albedo_render' in results[0]:
@@ -369,10 +372,11 @@ def quick_test():
     print("=" * 20)
 
     # Just check if API is accessible
-    result = requests.get(f"{BASE_URL}/")
+    result = requests.get(f"https://817a-37-16-65-130.ngrok-free.app/")
     if result:
         print("✓ API is accessible")
-        print(f"  Message: {result['message']}")
+        print(result)
+        # print(f"  Message: {result['message']}")
         return True
     else:
         print("✗ API is not accessible")

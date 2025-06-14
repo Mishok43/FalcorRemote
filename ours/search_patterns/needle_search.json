@@ -1,0 +1,31 @@
+{
+  "metadata": {
+    "object_name": "needle",
+    "total_patterns": 20
+  },
+  "patterns": {
+    "object_name": "needle",
+    "base_patterns": [
+      "Is needle present in the image?",
+      "Is there needle in the image?",
+      "Can you see needle in the image?",
+      "Do you see needle in the image?",
+      "Is needle visible in the image?",
+      "Does this image contain needle?",
+      "Are there needle in the image?",
+      "Is needle in the image?",
+      "Does the image show needle?",
+      "Is needle shown in the image?",
+      "Can you find needle in the image?",
+      "Is needle there in the image?",
+      "Does this picture have needle?",
+      "Is needle present?",
+      "Can you spot needle?",
+      "Is needle detectable?",
+      "Does the photo contain needle?",
+      "Are any needle visible?",
+      "Is needle apparent in the image?",
+      "Can you identify needle?"
+    ]
+  }
+}

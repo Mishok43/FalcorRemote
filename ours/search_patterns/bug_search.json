@@ -1,0 +1,31 @@
+{
+  "metadata": {
+    "object_name": "bug",
+    "total_patterns": 20
+  },
+  "patterns": {
+    "object_name": "bug",
+    "base_patterns": [
+      "Is bug present in the image?",
+      "Is there bug in the image?",
+      "Can you see bug in the image?",
+      "Do you see bug in the image?",
+      "Is bug visible in the image?",
+      "Does this image contain bug?",
+      "Are there bug in the image?",
+      "Is bug in the image?",
+      "Does the image show bug?",
+      "Is bug shown in the image?",
+      "Can you find bug in the image?",
+      "Is bug there in the image?",
+      "Does this picture have bug?",
+      "Is bug present?",
+      "Can you spot bug?",
+      "Is bug detectable?",
+      "Does the photo contain bug?",
+      "Are any bug visible?",
+      "Is bug apparent in the image?",
+      "Can you identify bug?"
+    ]
+  }
+}
