@@ -59,7 +59,8 @@ class BasicRasterizer:
                  enable_3d_viz: bool = False, viz_every_n_steps: int = 50, viz_resolution: int = 20,
                  # Simple Mistral integration
                  enable_mistral: bool = False, target_object: str = "target",
-                 use_direct_tensor: bool = True, debug_folder: Optional[str] = None):
+                 use_direct_tensor: bool = True, debug_folder: Optional[str] = None,
+                 warmup_frames: int = 3):
         self.render_width = render_width
         self.render_height = render_height
         self.verbose = verbose
@@ -88,6 +89,9 @@ class BasicRasterizer:
         self.target_found = False
         self.inference_iterations = 0
 
+        # Warm-up frames for inference
+        self.warmup_frames = warmup_frames
+
         if self.enable_mistral:
             try:
                 self.mistral_api = AsyncMistralVisionAPI(debug_folder=self.debug_folder)
@@ -107,7 +111,7 @@ class BasicRasterizer:
         self.testbed = None
         self.scene = None
         self.render_graph = None
-        self.rtxdi_render_graph = None  # RTXDI render graph for inference
+        self.pathtracer_render_graph = None  # MinimalPathTracer render graph for inference
         self.device = None
 
         # Keep alive flag to prevent garbage collection
@@ -459,6 +463,7 @@ class BasicRasterizer:
 
         self.testbed = common.create_testbed([self.render_width, self.render_height])
         self.device = self.testbed.device
+        self.testbed.render_graph = self.render_graph
         self._keep_alive = True  # Mark as active to prevent garbage collection
 
     def load_scene(self, scene_path: str):
@@ -527,51 +532,75 @@ class BasicRasterizer:
         # Assign render graph to testbed
         self.testbed.render_graph = self.render_graph
 
-    def setup_rtxdi_render_graph(self):
-        """Setup the RTXDI render graph for inference with Mistral API"""
+    def setup_pathtracer_render_graph(self):
+        """Setup the MinimalPathTracer render graph with AccumulatePass + DLSS for inference with Mistral API"""
         if self.verbose:
-            print("Setting up RTXDI render graph for inference")
+            print("Setting up MinimalPathTracer + AccumulatePass + DLSS render graph for inference")
 
-        # Create RTXDI render graph
-        self.rtxdi_render_graph = self.testbed.create_render_graph("RTXDI")
+        # Create MinimalPathTracer render graph
+        self.pathtracer_render_graph = self.testbed.create_render_graph("MinimalPathTracer")
 
         # VBufferRT pass
-        vbuffer_rt = self.rtxdi_render_graph.create_pass("VBufferRT", "VBufferRT")
-
-        # RTXDIPass
-        rtxdi_pass = self.rtxdi_render_graph.create_pass("RTXDIPass", "RTXDIPass")
-
-        # AccumulatePass (disabled for single frame rendering)
-        accumulate_pass = self.rtxdi_render_graph.create_pass(
-            "AccumulatePass",
-            "AccumulatePass",
-            {'enabled': False, 'precisionMode': 'Single'}
+        vbuffer_rt = self.pathtracer_render_graph.create_pass(
+            "VBufferRT",
+            "VBufferRT",
+            {'samplePattern': 'Stratified', 'sampleCount': 16, 'useAlphaTest': True}
         )
 
-        # ToneMapper (no auto exposure for consistent results)
-        tone_mapper = self.rtxdi_render_graph.create_pass(
-            "ToneMapper",
-            "ToneMapper",
-            {'autoExposure': True, 'exposureCompensation': 0.0}
+        # MinimalPathTracer pass
+        path_tracer = self.pathtracer_render_graph.create_pass(
+            "MinimalPathTracer",
+            "MinimalPathTracer",
+            {'maxBounces': 1}
         )
 
-        # Connect the passes
-        self.rtxdi_render_graph.add_edge("VBufferRT.vbuffer", "RTXDIPass.vbuffer")
-        self.rtxdi_render_graph.add_edge("VBufferRT.mvec", "RTXDIPass.mvec")
-        self.rtxdi_render_graph.add_edge("RTXDIPass.color", "AccumulatePass.input")
-        self.rtxdi_render_graph.add_edge("AccumulatePass.output", "ToneMapper.src")
+        # AccumulatePass (for temporal accumulation)
+        accumulate_pass = self.pathtracer_render_graph.create_pass(
+            "AccumulatePass",
+            "AccumulatePass",
+            {'enabled': True, 'precisionMode': 'Single'}
+        )
 
-        # Mark the final output
-        self.rtxdi_render_graph.mark_output("ToneMapper.dst")
+        # ToneMapper (after accumulation)
+        tone_mapper = self.pathtracer_render_graph.create_pass(
+            "ToneMapper",
+            "ToneMapper",
+            {'autoExposure': False, 'exposureCompensation': 0.0}
+        )
 
-    def switch_to_rtxdi_rendering(self):
-        """Switch to RTXDI rendering for inference"""
-        if self.rtxdi_render_graph is None:
-            self.setup_rtxdi_render_graph()
+        # DLSS Pass (after ToneMapper)
+        dlss_pass = self.pathtracer_render_graph.create_pass(
+            "DLSSPass",
+            "DLSSPass",
+            {'motionVectorScale': 'Relative'}
+        )
 
-        self.testbed.render_graph = self.rtxdi_render_graph
+        # Connect the passes: VBufferRT -> MinimalPathTracer -> AccumulatePass -> ToneMapper -> DLSS
+        self.pathtracer_render_graph.add_edge("VBufferRT.vbuffer", "MinimalPathTracer.vbuffer")
+        self.pathtracer_render_graph.add_edge("VBufferRT.viewW", "MinimalPathTracer.viewW")
+
+        # Path tracer to accumulate pass
+        self.pathtracer_render_graph.add_edge("MinimalPathTracer.color", "AccumulatePass.input")
+
+        # Accumulate pass to tone mapper
+        self.pathtracer_render_graph.add_edge("AccumulatePass.output", "ToneMapper.src")
+
+        # Connect DLSS inputs (tone mapped color + motion vectors + depth)
+        self.pathtracer_render_graph.add_edge("ToneMapper.dst", "DLSSPass.color")
+        self.pathtracer_render_graph.add_edge("VBufferRT.mvec", "DLSSPass.mvec")
+        self.pathtracer_render_graph.add_edge("VBufferRT.depth", "DLSSPass.depth")
+
+        # Mark the DLSS output as final
+        self.pathtracer_render_graph.mark_output("DLSSPass.output")
+
+    def switch_to_pathtracer_rendering(self):
+        """Switch to MinimalPathTracer rendering for inference"""
+        if self.pathtracer_render_graph is None:
+            self.setup_pathtracer_render_graph()
+
+        self.testbed.render_graph = self.pathtracer_render_graph
         if self.verbose:
-            print("Switched to RTXDI rendering")
+            print("Switched to MinimalPathTracer + AccumulatePass + DLSS rendering")
 
     def switch_to_basic_rendering(self):
         """Switch back to basic rasterization for training"""
@@ -700,50 +729,46 @@ class BasicRasterizer:
         start_time = time.time()
 
         # Execute rendering
-        self.testbed.frame()
+
+        self.scene.renderSettings.useEnvLight = True
+        self.scene.renderSettings.useEmissiveLights = False
+
+        # Check which render graph is active to determine warm-up frames
+        is_pathtracer = (self.testbed.render_graph == self.pathtracer_render_graph)
+
+        if is_pathtracer:
+            # MinimalPathTracer + DLSS rendering needs warm-up frames for inference
+            warmup_frames = getattr(self, 'warmup_frames', 3)
+            if self.verbose and warmup_frames > 1:
+                print(f"    Executing {warmup_frames} warm-up frames for MinimalPathTracer + AccumulatePass + DLSS...")
+            for _ in range(warmup_frames):
+                self.testbed.frame()
+        else:
+            # Basic rasterization - single frame is sufficient
+            self.testbed.frame()
 
         # Get outputs and convert to PyTorch via numpy
         outputs = {}
 
         # Check which render graph is active
-        is_rtxdi = (self.testbed.render_graph == self.rtxdi_render_graph)
+        is_pathtracer = (self.testbed.render_graph == self.pathtracer_render_graph)
 
-        if is_rtxdi:
-            # RTXDI rendering - get tone mapped output for Mistral
-            tone_mapped_buffer = self.testbed.render_graph.get_output("ToneMapper.dst")
-            if tone_mapped_buffer is not None:
-                tone_mapped_numpy = tone_mapped_buffer.to_numpy()
+        if is_pathtracer:
+            # MinimalPathTracer + DLSS rendering - get DLSS output for Mistral
+            dlss_buffer = self.testbed.render_graph.get_output("DLSSPass.output")
+            if dlss_buffer is not None:
+                dlss_numpy = dlss_buffer.to_numpy()
 
-                # Handle different output shapes from ToneMapper
-                if len(tone_mapped_numpy.shape) == 3:
-                    # Standard 3D array (H, W, C)
-                    tone_mapped_numpy = tone_mapped_numpy[:, :, :3]  # RGB only
-                elif len(tone_mapped_numpy.shape) == 2:
-                    # 2D array (H, W) - grayscale, convert to RGB
-                    tone_mapped_numpy = np.stack([tone_mapped_numpy] * 3, axis=-1)
-                elif len(tone_mapped_numpy.shape) == 1:
-                    # 1D array - reshape to image dimensions
-                    expected_size = self.render_width * self.render_height * 3
-                    if tone_mapped_numpy.size == expected_size:
-                        tone_mapped_numpy = tone_mapped_numpy.reshape(self.render_height, self.render_width, 3)
-                    elif tone_mapped_numpy.size == self.render_width * self.render_height:
-                        # Grayscale data
-                        tone_mapped_numpy = tone_mapped_numpy.reshape(self.render_height, self.render_width)
-                        tone_mapped_numpy = np.stack([tone_mapped_numpy] * 3, axis=-1)
-                    else:
-                        # Fallback: create a black image
-                        if self.verbose:
-                            print(f"Warning: Unexpected ToneMapper output size {tone_mapped_numpy.size}, expected {expected_size}")
-                        tone_mapped_numpy = np.zeros((self.render_height, self.render_width, 3), dtype=np.float32)
-                else:
-                    # Unexpected shape - create a black image
-                    if self.verbose:
-                        print(f"Warning: Unexpected ToneMapper output shape {tone_mapped_numpy.shape}")
-                    tone_mapped_numpy = np.zeros((self.render_height, self.render_width, 3), dtype=np.float32)
+                # DLSS outputs RGBA32Float, take RGB channels only
+                if len(dlss_numpy.shape) == 3 and dlss_numpy.shape[2] >= 3:
+                    dlss_numpy = dlss_numpy[:, :, :3]  # Take RGB only
 
-                outputs['diffuse'] = torch.from_numpy(tone_mapped_numpy)
+                # Ensure values are in [0,1] range for proper display
+                dlss_numpy = np.clip(dlss_numpy, 0.0, 1.0)
 
-            # For RTXDI, we don't calculate surface area (used for training only)
+                outputs['diffuse'] = torch.from_numpy(dlss_numpy)
+
+            # For MinimalPathTracer, we don't calculate surface area (used for training only)
             surface_area = 0.0
             surface_area_stats = {}
         else:
@@ -1163,6 +1188,7 @@ class BasicRasterizer:
             }
         }
 
+
         outputs, render_time = self.render_frame(camera_info)
 
         # Check for target if Mistral is enabled
@@ -1209,9 +1235,9 @@ class BasicRasterizer:
             print(f"Looking for target: '{self.target_object}'")
             print(f"Using pretrained NFSampler: {self.is_nf_trained}")
 
-        # Switch to RTXDI rendering for better quality inference images
+        # Switch to MinimalPathTracer rendering for better quality inference images
         if self.enable_mistral:
-            self.switch_to_rtxdi_rendering()
+            self.switch_to_pathtracer_rendering()
 
         # Set sliding window size
         window_size = 16 if self.enable_mistral else 1
@@ -1619,6 +1645,7 @@ async def main():
     parser.add_argument("--target_object", type=str, default="target", help="Object to search for with Mistral API")
     parser.add_argument("--use_disk_io", action="store_true", help="Use disk-based approach (save temp files) instead of direct tensor processing")
     parser.add_argument("--debug_folder", type=str, default=None, help="Save all Mistral requests (images + prompts) to this folder for debugging")
+    parser.add_argument("--warmup_frames", type=int, default=3, help="Number of warm-up frames for inference rendering (MinimalPathTracer + DLSS)")
 
     args = parser.parse_args()
 
@@ -1642,7 +1669,8 @@ async def main():
         enable_mistral=args.enable_mistral,
         target_object=args.target_object,
         use_direct_tensor=not args.use_disk_io,  # Invert the flag: --use_disk_io disables direct tensor
-        debug_folder=args.debug_folder
+        debug_folder=args.debug_folder,
+        warmup_frames=args.warmup_frames
     )
 
     try:
@@ -1650,7 +1678,7 @@ async def main():
         renderer.setup_falcor()
         renderer.load_scene(args.scene_file)
         renderer.setup_render_graph()
-        renderer.setup_rtxdi_render_graph()
+        renderer.setup_pathtracer_render_graph()
 
         results = []
 

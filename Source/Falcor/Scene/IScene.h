@@ -108,7 +108,7 @@ public:
     {
         bool useEnvLight = true;        ///< Enable lighting from environment map.
         bool useAnalyticLights = true;  ///< Enable lighting from analytic lights.
-        bool useEmissiveLights = true;  ///< Enable lighting from emissive lights.
+        bool useEmissiveLights = false;  ///< Enable lighting from emissive lights.
         bool useGridVolumes = true;     ///< Enable rendering of grid volumes.
 
         // DEMO21
