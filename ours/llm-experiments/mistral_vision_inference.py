@@ -321,6 +321,7 @@ class MistralVisionAPI:
         # Check for positive indicators
         for indicator in positive_indicators:
             if indicator in response_lower:
+                print(indicator)
                 return True
         
         # Check for negative indicators
@@ -488,7 +489,7 @@ Please respond with only 'yes' or 'no'."""
             return is_present
         else:
             # If we can't parse the response, return the full result
-            return result
+            return False
     
     def check_object_presence_timed(self, 
                                   image_path: str, 

@@ -1,0 +1,93 @@
+{
+  "metadata": {
+    "total_results": 3,
+    "created_at": "2025-06-15T02:39:35.249541",
+    "version": "1.0"
+  },
+  "results": [
+    {
+      "scene_path": "unknown",
+      "image_path": "images/depth_2.0.png",
+      "scene_description": "The image you've shared appears to be a digital illustration of a person's head and shoulders. Here's a detailed description:\n\n1. **Head**: The head is depicted in a pink color. It has a smooth, rounded shape, and the facial features are not visible.\n   \n2. **Shoulders**: The shoulders are shown in a dark purple color. They are broad and appear to be part of a larger body that is not fully visible in the image.\n\n3. **Neck**: The neck is not distinctly visible, suggesting that the head is directly connected to the shoulders.\n\n4. **Background**: The background of the image is white, which contrasts with the pink and dark purple colors of the head and shoulders, making them stand out.\n\n5. **Style**: The image has a minimalist and abstract style, focusing on basic shapes and colors rather than detailed features or textures.\n\nThis description is based on the visible elements in the image. If you have any specific questions or need further details, feel free to ask!",
+      "objects_present": [
+        "hut",
+        "shelter",
+        "dwelling",
+        "house",
+        "home",
+        "cabin",
+        "shack",
+        "tent",
+        "igloo",
+        "dome",
+        "structure",
+        "building",
+        "abode",
+        "residence",
+        "cover",
+        "canopy",
+        "roof",
+        "top",
+        "upper part",
+        "peak"
+      ],
+      "inference_timestamp": "2025-06-15T02:39:35.249524"
+    },
+    {
+      "scene_path": "unknown",
+      "image_path": "images/Unknown.jpeg",
+      "scene_description": "The image features a cat that occupies a significant portion of the frame. The cat is positioned towards the left side, stretching from the top to the bottom of the image. Its body is oriented vertically, and its head is slightly tilted, giving it an attentive and curious look. The cat's fur appears to be a mix of light and dark shades, possibly indicating a tabby breed. The background is plain and dark, which contrasts with the cat's fur, making it stand out prominently.",
+      "objects_present": [
+        "feline",
+        "cat",
+        "kitten",
+        "domestic cat",
+        "tabby cat",
+        "striped cat",
+        "tabby",
+        "mammal",
+        "animal",
+        "domestic animal",
+        "house cat",
+        "pet cat",
+        "feline animal",
+        "cat's head",
+        "cat's face",
+        "cat's eyes",
+        "whiskers",
+        "fur",
+        "coat",
+        "stripes"
+      ],
+      "inference_timestamp": "2025-06-15T02:39:35.249498"
+    },
+    {
+      "scene_path": "unknown",
+      "image_path": "images/image.png",
+      "scene_description": "The image depicts an outdoor urban scene. The main objects include a tall, ornate street lamp positioned in the foreground, a brick wall in the background, and a green shrubbery area in between. On top of the shrubbery, there is a colorful, possibly metallic, sculpture resembling a frog or a similar creature. The street lamp has intricate designs near its base, and the brick wall behind the shrubbery is composed of uniformly arranged red bricks. The overall atmosphere of the scene suggests a blend of urban and natural elements, with the sculpture adding a touch of whimsy.",
+      "objects_present": [
+        "lamppost",
+        "lamp post",
+        "street lamp",
+        "streetlight",
+        "lighting fixture",
+        "pole",
+        "pillar",
+        "column",
+        "bollard",
+        "post",
+        "street furniture",
+        "streetlight pole",
+        "lamp post fixture",
+        "street lamp post",
+        "lamp",
+        "light",
+        "illumination",
+        "illumination device",
+        "lighting",
+        "luminaire"
+      ],
+      "inference_timestamp": "2025-06-15T02:39:35.249532"
+    }
+  ]
+}
