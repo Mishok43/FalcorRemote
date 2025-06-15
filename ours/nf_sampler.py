@@ -94,7 +94,7 @@ class NFSampler(DummySampler):
     """
 
     def __init__(self, name=None, rng=None, num_flows=4, hidden_units=128, hidden_layers=3,
-                 learning_rate=1e-3, epochs_per_fit=25, batch_size=100, history_size=512, latent_size=5, device=None):
+                 learning_rate=1e-3, epochs_per_fit=25, batch_size=100, history_size=300, latent_size=5, device=None):
         super().__init__(name, rng)
 
         if not NORMFLOWS_AVAILABLE:

@@ -10,11 +10,17 @@ from pathlib import Path
 import json
 from typing import Tuple, List, Dict, Optional
 import datetime
+import asyncio
+from PIL import Image
 
 # Add the scripts directory to path for common module
 script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(script_dir)
 sys.path.append(os.path.join(parent_dir, 'scripts', 'inv-rendering'))
+
+# Add the llm-experiments directory for async_check_boolean
+llm_experiments_dir = os.path.join(script_dir, 'llm-experiments')
+sys.path.append(llm_experiments_dir)
 
 import torch
 import falcor
@@ -23,6 +29,14 @@ import common
 from surface_area_worker import SurfaceAreaCalculator
 from nf_sampler import NFSampler
 from predetermined_sampler import PredeterminedSampler
+
+# Import async Mistral functionality
+try:
+    from async_check_boolean import AsyncMistralVisionAPI
+    MISTRAL_AVAILABLE = True
+except ImportError:
+    MISTRAL_AVAILABLE = False
+    print("Warning: async_check_boolean module not available. Mistral integration disabled.")
 
 # 3D visualization imports (optional)
 try:
@@ -41,7 +55,9 @@ class BasicRasterizer:
     def __init__(self, render_width: int = 512, render_height: int = 512, verbose: bool = True,
                  use_nf_sampler: bool = True, initial_samples: int = 100, train_batch_size: int = 50,
                  predetermined_batch_size: int = 50, max_training_history: int = 2000,
-                 enable_3d_viz: bool = False, viz_every_n_steps: int = 50, viz_resolution: int = 20):
+                 enable_3d_viz: bool = False, viz_every_n_steps: int = 50, viz_resolution: int = 20,
+                 # Simple Mistral integration
+                 enable_mistral: bool = False, target_object: str = "target"):
         """
         Initialize the basic rasterizer with NFSampler integration
 
@@ -57,6 +73,8 @@ class BasicRasterizer:
             enable_3d_viz: Enable 3D likelihood visualization
             viz_every_n_steps: Show 3D visualization every N training steps
             viz_resolution: Resolution of 3D visualization grid (NxNxN)
+            enable_mistral: Enable Mistral Vision API integration
+            target_object: Object name to search for with Mistral API
         """
         self.render_width = render_width
         self.render_height = render_height
@@ -76,6 +94,24 @@ class BasicRasterizer:
         if self.enable_3d_viz and not VISUALIZATION_AVAILABLE:
             print("Warning: 3D visualization requested but libraries not available. Disabling 3D visualization.")
             self.enable_3d_viz = False
+
+        # Simple Mistral integration
+        self.enable_mistral = enable_mistral and MISTRAL_AVAILABLE
+        self.target_object = target_object
+        self.mistral_api = None
+        self.target_found = False
+        self.inference_iterations = 0
+
+        if self.enable_mistral:
+            try:
+                self.mistral_api = AsyncMistralVisionAPI()
+                print(f"Mistral API enabled for target: '{target_object}'")
+                # Create target folder
+                self.target_folder = Path("target_images")
+                self.target_folder.mkdir(exist_ok=True)
+            except Exception as e:
+                print(f"Warning: Failed to initialize Mistral API: {e}")
+                self.enable_mistral = False
 
         # Initialize Falcor components
         self.testbed = None
@@ -843,10 +879,10 @@ class BasicRasterizer:
             # Fall back to regular NF sampling
             return self.sample_camera_params_nf()
 
-    def render_samples(self, num_samples: int):
-        """Render multiple samples with adaptive camera sampling"""
+    def render_samples_training(self, num_samples: int):
+        """Training mode: render samples to train NFSampler"""
         if self.verbose:
-            print(f"Starting adaptive render of {num_samples} samples")
+            print(f"TRAINING MODE: {num_samples} samples")
             if self.use_nf_sampler:
                 print(f"NFSampler will be used after {self.train_batch_size} samples")
 
@@ -862,7 +898,7 @@ class BasicRasterizer:
                         method_preview = "NF-guided"
                 else:
                     method_preview = "Random"
-                print(f"Rendering sample {sample_id + 1}/{num_samples} ({method_preview})")
+                print(f"Training sample {sample_id + 1}/{num_samples} ({method_preview})")
 
             # Sample camera parameters (adaptive or random)
             if self.use_nf_sampler and self.is_nf_trained:
@@ -908,7 +944,6 @@ class BasicRasterizer:
                 'surface_area': surface_area,
                 'surface_area_stats': outputs.get('surface_area_stats', {}),
                 'sampling_method': sampling_method
-                # Note: Not storing 'outputs' to save memory - it contains large tensors
             }
 
             results.append(result)
@@ -922,16 +957,165 @@ class BasicRasterizer:
                 print(f"  Surface area: {surface_area:.6f}")
                 if self.use_nf_sampler:
                     print(f"  Training data: {len(self.training_data)}/{self.train_batch_size}")
-                    if self.predetermined_sampler:
-                        print(f"  Predetermined samples remaining: {self.predetermined_sampler.remaining_samples()}")
-                # Show GPU memory usage if available
-                if torch.cuda.is_available() and (sample_id + 1) % 20 == 0:
-                    memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-                    memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-                    print(f"  GPU Memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved")
 
         self._print_performance_stats()
         return results
+
+    async def check_target_in_image(self, tensor: torch.Tensor, sample_id: int) -> bool:
+        """Check if target object is in the rendered image using direct tensor processing"""
+        if not self.enable_mistral:
+            return False
+
+        try:
+            # Use the async API to check for object directly from tensor (no disk I/O)
+            result = await self.mistral_api.check_object_presence_from_tensor_async(
+                tensor, self.target_object
+            )
+
+            self.inference_iterations += 1
+
+            if self.verbose:
+                print(f"  Sample {sample_id}: {result.response_text} -> {result.is_present}")
+
+            return result.is_present
+
+        except Exception as e:
+            if self.verbose:
+                print(f"  Error checking target in sample {sample_id}: {e}")
+            return False
+
+    def save_target_image(self, tensor: torch.Tensor, sample_id: int) -> str:
+        """Save the target image as target.jpeg"""
+        # Ensure tensor is on CPU
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+
+        # Convert to numpy and ensure correct range [0, 1] -> [0, 255]
+        if tensor.dtype == torch.float32 or tensor.dtype == torch.float64:
+            np_array = (torch.clamp(tensor, 0, 1) * 255).byte().numpy()
+        else:
+            np_array = tensor.numpy()
+
+        # Handle different tensor shapes
+        if len(np_array.shape) == 3 and np_array.shape[2] >= 3:
+            np_array = np_array[:, :, :3]  # Take RGB only
+
+        # Convert to PIL Image and save as target.jpeg
+        pil_image = Image.fromarray(np_array, mode='RGB')
+        filepath = self.target_folder / "target.jpeg"
+        pil_image.save(filepath, quality=95)
+
+        return str(filepath)
+
+    async def render_single_sample_async(self, sample_id: int):
+        """Render a single sample asynchronously"""
+        if self.verbose:
+            method = "NF-guided" if (self.use_nf_sampler and self.is_nf_trained) else "Random"
+            print(f"Inference sample {sample_id + 1} ({method})")
+
+        # Sample camera parameters using trained model
+        if self.use_nf_sampler and self.is_nf_trained:
+            camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_nf()
+            sampling_method = "NF-guided"
+        else:
+            camera_pos, camera_dir, input_5d, sample_pdf = self.sample_camera_params_random()
+            sampling_method = "Random"
+
+        # Set camera and render
+        self.set_camera(camera_pos, camera_dir)
+
+        camera_info = {
+            "sample_id": sample_id,
+            "position": camera_pos.tolist(),
+            "direction": camera_dir.tolist(),
+            "target": (camera_pos + camera_dir).tolist(),
+            "input_5d": input_5d.tolist(),
+            "scene_bounds": {
+                "min": self.scene_bounds[0].tolist(),
+                "max": self.scene_bounds[1].tolist()
+            }
+        }
+
+        outputs, render_time = self.render_frame(camera_info)
+
+        # Check for target if Mistral is enabled
+        target_found = False
+        if self.enable_mistral and 'diffuse' in outputs and not self.target_found:
+            target_found = await self.check_target_in_image(outputs['diffuse'], sample_id)
+
+            if target_found:
+                self.target_found = True
+                saved_path = self.save_target_image(outputs['diffuse'], sample_id)
+
+                print(f"\n🎯 TARGET FOUND! 🎯")
+                print(f"The request is matched after {self.inference_iterations} inference-iterations (non-trainable).")
+                print(f"You can find target there: {saved_path}")
+            else:
+                print(f"Target not found in image {sample_id}")
+
+        result = {
+            'sample_id': sample_id,
+            'camera_info': camera_info,
+            'render_time': render_time,
+            'surface_area': outputs.get('surface_area', 0.0),
+            'sampling_method': sampling_method,
+            'target_found': target_found
+        }
+
+        if self.verbose:
+            print(f"  Render time: {render_time:.3f}s")
+            if self.enable_mistral:
+                print(f"  Inference iterations: {self.inference_iterations}")
+
+        return result
+
+    async def render_samples_inference(self, num_samples: int):
+        """Inference mode: render samples with sliding window concurrency"""
+        if self.verbose:
+            print(f"INFERENCE MODE: {num_samples} samples")
+            print(f"Looking for target: '{self.target_object}'")
+            print(f"Using pretrained NFSampler: {self.is_nf_trained}")
+
+        # Set sliding window size
+        window_size = 1924 if self.enable_mistral else 1
+        if self.verbose:
+            print(f"Sliding window size: {window_size}")
+
+        results = []
+        tasks = []
+
+        for sample_id in range(num_samples):
+            if self.target_found:
+                print(f"Target found! Stopping inference at sample {sample_id}")
+                break
+
+            # Create async task for this sample
+            task = asyncio.create_task(self.render_single_sample_async(sample_id))
+            tasks.append(task)
+
+            # Process completed tasks when window is full or at the end
+            if len(tasks) >= window_size or sample_id == num_samples - 1:
+                # Wait for all tasks in current window to complete
+                completed_results = await asyncio.gather(*tasks)
+                results.extend(completed_results)
+
+                # Check if target was found in any of the completed tasks
+                if any(result.get('target_found', False) for result in completed_results):
+                    break
+
+                # Clear tasks for next window
+                tasks = []
+
+        # Process any remaining tasks
+        if tasks:
+            completed_results = await asyncio.gather(*tasks)
+            results.extend(completed_results)
+
+        return results
+
+    def render_samples(self, num_samples: int):
+        """Backward compatibility wrapper"""
+        return self.render_samples_training(num_samples)
 
     def _print_performance_stats(self):
         """Print performance statistics"""
@@ -1248,10 +1432,10 @@ class BasicRasterizer:
         return stats
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Basic Falcor Rasterizer with NFSampler for Adaptive Camera Sampling")
-    parser.add_argument("--scene-file",  default="D:/Models/CornellBox/cornell_box.pyscene", help="Path to scene file (.pyscene, .fbx, .gltf, etc.)")
-    parser.add_argument("--num_samples", type=int, default=2000, help="Number of samples to render")
+async def main():
+    parser = argparse.ArgumentParser(description="Basic Falcor Rasterizer with NFSampler and Mistral API")
+    parser.add_argument("--scene-file",  default="C:/Users/devmi/OneDrive/Documents/Bistro_v5_2/Bistro_v5_2/BistroOur.fbx", help="Path to scene file (.pyscene, .fbx, .gltf, etc.)")
+    parser.add_argument("--num_samples", type=int, default=500, help="Number of samples to render")
     parser.add_argument("--width", type=int, default=512, help="Render width")
     parser.add_argument("--height", type=int, default=512, help="Render height")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -1259,10 +1443,17 @@ def main():
     parser.add_argument("--no_nf", action="store_true", help="Disable NFSampler (use random sampling only)")
     parser.add_argument("--train_batch_size", type=int, default=100, help="Minimum samples before training NFSampler")
     parser.add_argument("--predetermined_batch_size", type=int, default=50, help="Number of samples to pre-generate from NFSampler for efficiency")
-    parser.add_argument("--max_training_history", type=int, default=2000, help="Maximum number of training samples to keep in memory")
+    parser.add_argument("--max_training_history", type=int, default=300, help="Maximum number of training samples to keep in memory")
     parser.add_argument("--enable_3d_viz", action="store_true", help="Enable 3D likelihood visualization")
     parser.add_argument("--viz_every_n_steps", type=int, default=200, help="Show 3D visualization every N training steps")
     parser.add_argument("--viz_resolution", type=int, default=25, help="Resolution of 3D visualization grid (NxNxN)")
+
+    # Simple workflow arguments
+    parser.add_argument("--mode", choices=["train", "inference", "both"], default="both",
+                       help="Mode: 'train' (only training), 'inference' (only inference), 'both' (train then inference)")
+    parser.add_argument("--weights_file", type=str, default="nf_weights.pth", help="Path to save/load NFSampler weights")
+    parser.add_argument("--enable_mistral", action="store_true", help="Enable Mistral API for target detection")
+    parser.add_argument("--target_object", type=str, default="target", help="Object to search for with Mistral API")
 
     args = parser.parse_args()
 
@@ -1282,29 +1473,63 @@ def main():
         max_training_history=args.max_training_history,
         enable_3d_viz=args.enable_3d_viz,
         viz_every_n_steps=args.viz_every_n_steps,
-        viz_resolution=args.viz_resolution
+        viz_resolution=args.viz_resolution,
+        enable_mistral=args.enable_mistral,
+        target_object=args.target_object
     )
 
     try:
         # Setup Falcor
         renderer.setup_falcor()
-
-        # Load scene
         renderer.load_scene(args.scene_file)
-
-        # Setup render graph
         renderer.setup_render_graph()
 
-        # Render samples with adaptive sampling
-        results = renderer.render_samples(args.num_samples)
+        results = []
 
-        print("Rendering complete!")
-        print(f"Rendered {len(results)} samples with adaptive camera sampling")
+        # PHASE 1: TRAINING
+        if args.mode in ["train", "both"]:
+            print("\n" + "="*50)
+            print("PHASE 1: TRAINING NFSampler")
+            print("="*50)
 
-        if renderer.use_nf_sampler and renderer.is_nf_trained:
-            print("NFSampler was successfully trained and used for adaptive sampling")
+            training_results = renderer.render_samples_training(args.num_samples)
+            results.extend(training_results)
 
-        # Optional: return results for further processing
+            if renderer.use_nf_sampler and renderer.is_nf_trained:
+                renderer.save_nf_weights(args.weights_file)
+                print(f"✅ NFSampler trained and saved to: {args.weights_file}")
+            else:
+                print("❌ NFSampler training failed")
+
+                # PHASE 2: INFERENCE
+        if args.mode in ["inference", "both"]:
+            print("\n" + "="*50)
+            print("PHASE 2: INFERENCE WITH MISTRAL API")
+            print("="*50)
+
+            # Load weights if doing inference only
+            if args.mode == "inference":
+                if os.path.exists(args.weights_file):
+                    renderer.load_nf_weights(args.weights_file)
+                    print(f"✅ Loaded weights from: {args.weights_file}")
+                else:
+                    print(f"❌ Weights file not found: {args.weights_file}")
+                    print("⚠️  Continuing with random sampling (no NFSampler)")
+
+            if not args.enable_mistral:
+                print("Warning: Mistral API not enabled. Skipping inference.")
+            else:
+                # Run inference with target detection
+                inference_samples = min(args.num_samples, 100) if args.mode == "both" else args.num_samples
+                inference_results = await renderer.render_samples_inference(inference_samples)
+                results.extend(inference_results)
+
+                if renderer.target_found:
+                    print(f"🎉 SUCCESS! Target found!")
+                else:
+                    print(f"😞 Target not found after {renderer.inference_iterations} iterations")
+
+        print(f"\nTotal samples processed: {len(results)}")
         return results
 
     except Exception as e:
@@ -1313,10 +1538,8 @@ def main():
         traceback.print_exc()
         return None
 
-    return 0
-
 
 if __name__ == "__main__":
-    results = main()
+    results = asyncio.run(main())
     if results is not None:
         print(f"Results contain {len(results)} samples with adaptive camera sampling and surface area data")
