@@ -985,7 +985,7 @@ class BasicRasterizer:
             return False
 
     def save_target_image(self, tensor: torch.Tensor, sample_id: int) -> str:
-        """Save the target image as target.jpeg"""
+        """Save the potential target image with sample_id in filename"""
         # Ensure tensor is on CPU
         if tensor.is_cuda:
             tensor = tensor.cpu()
@@ -1000,9 +1000,9 @@ class BasicRasterizer:
         if len(np_array.shape) == 3 and np_array.shape[2] >= 3:
             np_array = np_array[:, :, :3]  # Take RGB only
 
-        # Convert to PIL Image and save as target.jpeg
+        # Convert to PIL Image and save with sample_id in filename
         pil_image = Image.fromarray(np_array, mode='RGB')
-        filepath = self.target_folder / "target.jpeg"
+        filepath = self.target_folder / f"target_sample_{sample_id:04d}.jpeg"
         pil_image.save(filepath, quality=95)
 
         return str(filepath)
@@ -1040,18 +1040,25 @@ class BasicRasterizer:
 
         # Check for target if Mistral is enabled
         target_found = False
-        if self.enable_mistral and 'diffuse' in outputs and not self.target_found:
+        if self.enable_mistral and 'diffuse' in outputs:
             target_found = await self.check_target_in_image(outputs['diffuse'], sample_id)
 
             if target_found:
-                self.target_found = True
+                # Save the potential target image with sample_id in filename
                 saved_path = self.save_target_image(outputs['diffuse'], sample_id)
 
-                print(f"\n🎯 TARGET FOUND! 🎯")
-                print(f"The request is matched after {self.inference_iterations} inference-iterations (non-trainable).")
-                print(f"You can find target there: {saved_path}")
+                print(f"\n🎯 POTENTIAL TARGET FOUND! 🎯")
+                print(f"Sample {sample_id}: Mistral detected '{self.target_object}' (inference #{self.inference_iterations})")
+                print(f"Saved to: {saved_path}")
+                print("Continuing search to find more candidates...\n")
+
+                # Keep track of how many we found but don't stop
+                if not hasattr(self, 'targets_found_count'):
+                    self.targets_found_count = 0
+                self.targets_found_count += 1
             else:
-                print(f"Target not found in image {sample_id}")
+                if self.verbose:
+                    print(f"  Sample {sample_id}: No target detected")
 
         result = {
             'sample_id': sample_id,
@@ -1085,10 +1092,6 @@ class BasicRasterizer:
         tasks = []
 
         for sample_id in range(num_samples):
-            if self.target_found:
-                print(f"Target found! Stopping inference at sample {sample_id}")
-                break
-
             # Create async task for this sample
             task = asyncio.create_task(self.render_single_sample_async(sample_id))
             tasks.append(task)
@@ -1099,10 +1102,6 @@ class BasicRasterizer:
                 completed_results = await asyncio.gather(*tasks)
                 results.extend(completed_results)
 
-                # Check if target was found in any of the completed tasks
-                if any(result.get('target_found', False) for result in completed_results):
-                    break
-
                 # Clear tasks for next window
                 tasks = []
 
@@ -1110,6 +1109,19 @@ class BasicRasterizer:
         if tasks:
             completed_results = await asyncio.gather(*tasks)
             results.extend(completed_results)
+
+        # Print final summary
+        if self.enable_mistral:
+            targets_found = getattr(self, 'targets_found_count', 0)
+            print(f"\n📊 INFERENCE COMPLETE 📊")
+            print(f"Total samples processed: {len(results)}")
+            print(f"Total inference iterations: {self.inference_iterations}")
+            print(f"Potential targets found: {targets_found}")
+            if targets_found > 0:
+                print(f"Target images saved in: {self.target_folder}")
+                print("Review all saved images to verify which ones actually contain the target!")
+            else:
+                print("No potential targets detected by Mistral.")
 
         return results
 
@@ -1523,11 +1535,6 @@ async def main():
                 inference_samples = min(args.num_samples, 100) if args.mode == "both" else args.num_samples
                 inference_results = await renderer.render_samples_inference(inference_samples)
                 results.extend(inference_results)
-
-                if renderer.target_found:
-                    print(f"🎉 SUCCESS! Target found!")
-                else:
-                    print(f"😞 Target not found after {renderer.inference_iterations} iterations")
 
         print(f"\nTotal samples processed: {len(results)}")
         return results
