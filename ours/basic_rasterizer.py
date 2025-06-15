@@ -99,9 +99,16 @@ class BasicRasterizer:
                 debug_info = f" with debug folder: {self.debug_folder}" if self.debug_folder else ""
                 print(f"Mistral API enabled for target: '{target_object}' using {approach}{debug_info}")
 
-                # Create target folder
+                # Create target folder and clear any existing images
                 self.target_folder = Path("target_images")
+                if self.target_folder.exists():
+                    shutil.rmtree(self.target_folder)
+                    if self.verbose:
+                        print(f"🗑️  Cleared existing target images folder")
+
                 self.target_folder.mkdir(exist_ok=True)
+                if self.verbose:
+                    print(f"📁 Target images folder ready: {self.target_folder}")
 
             except Exception as e:
                 print(f"Warning: Failed to initialize Mistral API: {e}")
@@ -533,12 +540,12 @@ class BasicRasterizer:
         self.testbed.render_graph = self.render_graph
 
     def setup_pathtracer_render_graph(self):
-        """Setup the MinimalPathTracer render graph with AccumulatePass + DLSS for inference with Mistral API"""
+        """Setup the PathTracer render graph with AccumulatePass + OptixDenoiser for inference with Mistral API"""
         if self.verbose:
-            print("Setting up MinimalPathTracer + AccumulatePass + DLSS render graph for inference")
+            print("Setting up PathTracer + AccumulatePass + OptixDenoiser render graph for inference")
 
-        # Create MinimalPathTracer render graph
-        self.pathtracer_render_graph = self.testbed.create_render_graph("MinimalPathTracer")
+        # Create PathTracer render graph
+        self.pathtracer_render_graph = self.testbed.create_render_graph("PathTracer")
 
         # VBufferRT pass
         vbuffer_rt = self.pathtracer_render_graph.create_pass(
@@ -547,10 +554,10 @@ class BasicRasterizer:
             {'samplePattern': 'Stratified', 'sampleCount': 16, 'useAlphaTest': True}
         )
 
-        # MinimalPathTracer pass
+        # PathTracer pass (full path tracer with albedo and normal outputs)
         path_tracer = self.pathtracer_render_graph.create_pass(
-            "MinimalPathTracer",
-            "MinimalPathTracer",
+            "PathTracer",
+            "PathTracer",
             {'maxBounces': 1}
         )
 
@@ -561,46 +568,47 @@ class BasicRasterizer:
             {'enabled': True, 'precisionMode': 'Single'}
         )
 
-        # ToneMapper (after accumulation)
+        # ToneMapper (after accumulation, before denoising)
         tone_mapper = self.pathtracer_render_graph.create_pass(
             "ToneMapper",
             "ToneMapper",
             {'autoExposure': False, 'exposureCompensation': 0.0}
         )
 
-        # DLSS Pass (after ToneMapper)
-        dlss_pass = self.pathtracer_render_graph.create_pass(
-            "DLSSPass",
-            "DLSSPass",
-            {'motionVectorScale': 'Relative'}
+        # OptixDenoiser Pass (after ToneMapper)
+        optix_denoiser = self.pathtracer_render_graph.create_pass(
+            "OptixDenoiser",
+            "OptixDenoiser"
         )
 
-        # Connect the passes: VBufferRT -> MinimalPathTracer -> AccumulatePass -> ToneMapper -> DLSS
-        self.pathtracer_render_graph.add_edge("VBufferRT.vbuffer", "MinimalPathTracer.vbuffer")
-        self.pathtracer_render_graph.add_edge("VBufferRT.viewW", "MinimalPathTracer.viewW")
+        # Connect the passes: VBufferRT -> PathTracer -> AccumulatePass -> ToneMapper -> OptixDenoiser
+        self.pathtracer_render_graph.add_edge("VBufferRT.vbuffer", "PathTracer.vbuffer")
+        self.pathtracer_render_graph.add_edge("VBufferRT.viewW", "PathTracer.viewW")
 
         # Path tracer to accumulate pass
-        self.pathtracer_render_graph.add_edge("MinimalPathTracer.color", "AccumulatePass.input")
+        self.pathtracer_render_graph.add_edge("PathTracer.color", "AccumulatePass.input")
 
         # Accumulate pass to tone mapper
         self.pathtracer_render_graph.add_edge("AccumulatePass.output", "ToneMapper.src")
 
-        # Connect DLSS inputs (tone mapped color + motion vectors + depth)
-        self.pathtracer_render_graph.add_edge("ToneMapper.dst", "DLSSPass.color")
-        self.pathtracer_render_graph.add_edge("VBufferRT.mvec", "DLSSPass.mvec")
-        self.pathtracer_render_graph.add_edge("VBufferRT.depth", "DLSSPass.depth")
+        # Connect OptixDenoiser inputs (tone mapped color + auxiliary buffers for better denoising)
+        # PathTracer outputs albedo and guideNormal unlike MinimalPathTracer
+        self.pathtracer_render_graph.add_edge("ToneMapper.dst", "OptixDenoiser.color")
+        self.pathtracer_render_graph.add_edge("PathTracer.albedo", "OptixDenoiser.albedo")
+        self.pathtracer_render_graph.add_edge("PathTracer.guideNormal", "OptixDenoiser.normal")
+        self.pathtracer_render_graph.add_edge("VBufferRT.mvec", "OptixDenoiser.mvec")
 
-        # Mark the DLSS output as final
-        self.pathtracer_render_graph.mark_output("DLSSPass.output")
+        # Mark the OptixDenoiser output as final
+        self.pathtracer_render_graph.mark_output("OptixDenoiser.output")
 
     def switch_to_pathtracer_rendering(self):
-        """Switch to MinimalPathTracer rendering for inference"""
+        """Switch to PathTracer rendering for inference"""
         if self.pathtracer_render_graph is None:
             self.setup_pathtracer_render_graph()
 
         self.testbed.render_graph = self.pathtracer_render_graph
         if self.verbose:
-            print("Switched to MinimalPathTracer + AccumulatePass + DLSS rendering")
+            print("Switched to PathTracer + AccumulatePass + OptixDenoiser rendering")
 
     def switch_to_basic_rendering(self):
         """Switch back to basic rasterization for training"""
@@ -737,12 +745,13 @@ class BasicRasterizer:
         is_pathtracer = (self.testbed.render_graph == self.pathtracer_render_graph)
 
         if is_pathtracer:
-            # MinimalPathTracer + DLSS rendering needs warm-up frames for inference
+            # PathTracer + OptixDenoiser rendering needs warm-up frames for inference
             warmup_frames = getattr(self, 'warmup_frames', 3)
             if self.verbose and warmup_frames > 1:
-                print(f"    Executing {warmup_frames} warm-up frames for MinimalPathTracer + AccumulatePass + DLSS...")
+                print(f"    Executing {warmup_frames} warm-up frames for PathTracer + AccumulatePass + OptixDenoiser...")
             for _ in range(warmup_frames):
                 self.testbed.frame()
+
         else:
             # Basic rasterization - single frame is sufficient
             self.testbed.frame()
@@ -754,21 +763,17 @@ class BasicRasterizer:
         is_pathtracer = (self.testbed.render_graph == self.pathtracer_render_graph)
 
         if is_pathtracer:
-            # MinimalPathTracer + DLSS rendering - get DLSS output for Mistral
-            dlss_buffer = self.testbed.render_graph.get_output("DLSSPass.output")
-            if dlss_buffer is not None:
-                dlss_numpy = dlss_buffer.to_numpy()
-
-                # DLSS outputs RGBA32Float, take RGB channels only
-                if len(dlss_numpy.shape) == 3 and dlss_numpy.shape[2] >= 3:
-                    dlss_numpy = dlss_numpy[:, :, :3]  # Take RGB only
+            # PathTracer + OptixDenoiser rendering - get OptixDenoiser output for Mistral
+            optix_buffer = self.testbed.render_graph.get_output("OptixDenoiser.output")
+            if optix_buffer is not None:
+                optix_numpy = optix_buffer.to_numpy()
 
                 # Ensure values are in [0,1] range for proper display
-                dlss_numpy = np.clip(dlss_numpy, 0.0, 1.0)
+                optix_numpy = np.clip(optix_numpy, 0.0, 1.0)
 
-                outputs['diffuse'] = torch.from_numpy(dlss_numpy)
+                outputs['diffuse'] = torch.from_numpy(optix_numpy)
 
-            # For MinimalPathTracer, we don't calculate surface area (used for training only)
+            # For PathTracer, we don't calculate surface area (used for training only)
             surface_area = 0.0
             surface_area_stats = {}
         else:
@@ -1235,7 +1240,7 @@ class BasicRasterizer:
             print(f"Looking for target: '{self.target_object}'")
             print(f"Using pretrained NFSampler: {self.is_nf_trained}")
 
-        # Switch to MinimalPathTracer rendering for better quality inference images
+        # Switch to PathTracer rendering for better quality inference images
         if self.enable_mistral:
             self.switch_to_pathtracer_rendering()
 
@@ -1645,7 +1650,7 @@ async def main():
     parser.add_argument("--target_object", type=str, default="target", help="Object to search for with Mistral API")
     parser.add_argument("--use_disk_io", action="store_true", help="Use disk-based approach (save temp files) instead of direct tensor processing")
     parser.add_argument("--debug_folder", type=str, default=None, help="Save all Mistral requests (images + prompts) to this folder for debugging")
-    parser.add_argument("--warmup_frames", type=int, default=3, help="Number of warm-up frames for inference rendering (MinimalPathTracer + DLSS)")
+    parser.add_argument("--warmup_frames", type=int, default=3, help="Number of warm-up frames for inference rendering (PathTracer + AccumulatePass + OptixDenoiser)")
 
     args = parser.parse_args()
 
