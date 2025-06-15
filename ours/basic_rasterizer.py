@@ -377,6 +377,10 @@ class BasicRasterizer:
 
     def denormalize_position(self, normalized_pos: np.ndarray) -> np.ndarray:
         """Convert normalized [0,1] position back to absolute coordinates"""
+        if self.scene_bounds is None:
+            # Use default bounds if no scene is loaded
+            self.scene_bounds = (np.array([-5.0, -5.0, -5.0]), np.array([5.0, 5.0, 5.0]))
+
         min_bounds, max_bounds = self.scene_bounds
         bounds_size = max_bounds - min_bounds
 
@@ -1152,6 +1156,96 @@ class BasicRasterizer:
 
         self.viz_step_counter += 1
         return self.viz_step_counter % self.viz_every_n_steps == 0
+
+    def save_nf_weights(self, filepath: str):
+        """
+        Save NFSampler weights and training data
+
+        Args:
+            filepath: Path to save the weights (should end with .pth or .pt)
+        """
+        if not self.use_nf_sampler:
+            raise Exception("NFSampler is not enabled")
+
+        if self.nf_sampler is None:
+            raise Exception("NFSampler is not initialized")
+
+        self.nf_sampler.save_weights(filepath)
+        if self.verbose:
+            print(f"NFSampler weights saved to: {filepath}")
+
+    def load_nf_weights(self, filepath: str, load_training_data: bool = True):
+        """
+        Load NFSampler weights and optionally training data
+
+        Args:
+            filepath: Path to the saved weights file
+            load_training_data: Whether to load the training data as well
+        """
+        if not self.use_nf_sampler:
+            raise Exception("NFSampler is not enabled")
+
+        if self.nf_sampler is None:
+            self.setup_nf_sampler()
+
+        self.nf_sampler.load_weights(filepath, load_training_data)
+
+        # Update training status
+        if self.nf_sampler.all_x is not None and self.nf_sampler.all_x.shape[0] > 0:
+            self.is_nf_trained = True
+            # Update training data list for compatibility
+            self.training_data = []
+            for i in range(self.nf_sampler.all_x.shape[0]):
+                x_data = self.nf_sampler.all_x[i].cpu().numpy().tolist()
+                y_data = self.nf_sampler.all_y_unnormalized[i].cpu().numpy().item()
+                pdf_data = self.nf_sampler.all_x_pdf[i].cpu().numpy().item()
+                self.training_data.append((x_data, y_data, pdf_data))
+
+        if self.verbose:
+            print(f"NFSampler weights loaded from: {filepath}")
+            print(f"NFSampler trained: {self.is_nf_trained}")
+
+    def get_nf_training_stats(self) -> Dict:
+        """
+        Get statistics about the NFSampler training data
+
+        Returns:
+            Dictionary with training statistics
+        """
+        if not self.use_nf_sampler or self.nf_sampler is None:
+            return {"error": "NFSampler not available"}
+
+        stats = {
+            "is_initialized": self.nf_sampler.is_initialized,
+            "is_trained": self.is_nf_trained,
+            "total_dimensions": self.nf_sampler.total_dimensions,
+            "latent_size": self.nf_sampler.latent_size,
+            "training_samples": 0,
+            "config": {
+                "hidden_units": self.nf_sampler.hidden_units,
+                "hidden_layers": self.nf_sampler.hidden_layers,
+                "learning_rate": self.nf_sampler.learning_rate,
+                "num_flows": self.nf_sampler.num_flows,
+                "epochs_per_fit": self.nf_sampler.epochs_per_fit,
+                "batch_size": self.nf_sampler.batch_size,
+                "history_size": self.nf_sampler.history_size,
+                "device": str(self.nf_sampler.device)
+            }
+        }
+
+        if self.nf_sampler.all_x is not None:
+            stats["training_samples"] = self.nf_sampler.all_x.shape[0]
+
+            # Calculate statistics on training data
+            y_data = self.nf_sampler.all_y_unnormalized.cpu().numpy()
+            stats["performance_stats"] = {
+                "min_performance": float(np.min(y_data)),
+                "max_performance": float(np.max(y_data)),
+                "mean_performance": float(np.mean(y_data)),
+                "std_performance": float(np.std(y_data))
+            }
+
+        return stats
 
 
 def main():
