@@ -11,6 +11,7 @@ import json
 from typing import Tuple, List, Dict, Optional
 import datetime
 import asyncio
+import tempfile
 from PIL import Image
 
 # Add the scripts directory to path for common module
@@ -57,25 +58,8 @@ class BasicRasterizer:
                  predetermined_batch_size: int = 50, max_training_history: int = 2000,
                  enable_3d_viz: bool = False, viz_every_n_steps: int = 50, viz_resolution: int = 20,
                  # Simple Mistral integration
-                 enable_mistral: bool = False, target_object: str = "target"):
-        """
-        Initialize the basic rasterizer with NFSampler integration
-
-        Args:
-            render_width: Width of rendered images
-            render_height: Height of rendered images
-            verbose: Enable verbose output
-            use_nf_sampler: Whether to use NFSampler for adaptive sampling
-            initial_samples: Number of initial random samples before training
-            train_batch_size: Minimum samples needed before training NFSampler
-            predetermined_batch_size: Number of samples to pre-generate for efficiency
-            max_training_history: Maximum number of training samples to keep in memory
-            enable_3d_viz: Enable 3D likelihood visualization
-            viz_every_n_steps: Show 3D visualization every N training steps
-            viz_resolution: Resolution of 3D visualization grid (NxNxN)
-            enable_mistral: Enable Mistral Vision API integration
-            target_object: Object name to search for with Mistral API
-        """
+                 enable_mistral: bool = False, target_object: str = "target",
+                 use_direct_tensor: bool = True, debug_folder: Optional[str] = None):
         self.render_width = render_width
         self.render_height = render_height
         self.verbose = verbose
@@ -98,17 +82,23 @@ class BasicRasterizer:
         # Simple Mistral integration
         self.enable_mistral = enable_mistral and MISTRAL_AVAILABLE
         self.target_object = target_object
+        self.use_direct_tensor = use_direct_tensor
+        self.debug_folder = debug_folder
         self.mistral_api = None
         self.target_found = False
         self.inference_iterations = 0
 
         if self.enable_mistral:
             try:
-                self.mistral_api = AsyncMistralVisionAPI()
-                print(f"Mistral API enabled for target: '{target_object}'")
+                self.mistral_api = AsyncMistralVisionAPI(debug_folder=self.debug_folder)
+                approach = "direct tensor processing (no disk I/O)" if self.use_direct_tensor else "disk-based (temp files)"
+                debug_info = f" with debug folder: {self.debug_folder}" if self.debug_folder else ""
+                print(f"Mistral API enabled for target: '{target_object}' using {approach}{debug_info}")
+
                 # Create target folder
                 self.target_folder = Path("target_images")
                 self.target_folder.mkdir(exist_ok=True)
+
             except Exception as e:
                 print(f"Warning: Failed to initialize Mistral API: {e}")
                 self.enable_mistral = False
@@ -117,6 +107,7 @@ class BasicRasterizer:
         self.testbed = None
         self.scene = None
         self.render_graph = None
+        self.rtxdi_render_graph = None  # RTXDI render graph for inference
         self.device = None
 
         # Keep alive flag to prevent garbage collection
@@ -536,6 +527,58 @@ class BasicRasterizer:
         # Assign render graph to testbed
         self.testbed.render_graph = self.render_graph
 
+    def setup_rtxdi_render_graph(self):
+        """Setup the RTXDI render graph for inference with Mistral API"""
+        if self.verbose:
+            print("Setting up RTXDI render graph for inference")
+
+        # Create RTXDI render graph
+        self.rtxdi_render_graph = self.testbed.create_render_graph("RTXDI")
+
+        # VBufferRT pass
+        vbuffer_rt = self.rtxdi_render_graph.create_pass("VBufferRT", "VBufferRT")
+
+        # RTXDIPass
+        rtxdi_pass = self.rtxdi_render_graph.create_pass("RTXDIPass", "RTXDIPass")
+
+        # AccumulatePass (disabled for single frame rendering)
+        accumulate_pass = self.rtxdi_render_graph.create_pass(
+            "AccumulatePass",
+            "AccumulatePass",
+            {'enabled': False, 'precisionMode': 'Single'}
+        )
+
+        # ToneMapper (no auto exposure for consistent results)
+        tone_mapper = self.rtxdi_render_graph.create_pass(
+            "ToneMapper",
+            "ToneMapper",
+            {'autoExposure': True, 'exposureCompensation': 0.0}
+        )
+
+        # Connect the passes
+        self.rtxdi_render_graph.add_edge("VBufferRT.vbuffer", "RTXDIPass.vbuffer")
+        self.rtxdi_render_graph.add_edge("VBufferRT.mvec", "RTXDIPass.mvec")
+        self.rtxdi_render_graph.add_edge("RTXDIPass.color", "AccumulatePass.input")
+        self.rtxdi_render_graph.add_edge("AccumulatePass.output", "ToneMapper.src")
+
+        # Mark the final output
+        self.rtxdi_render_graph.mark_output("ToneMapper.dst")
+
+    def switch_to_rtxdi_rendering(self):
+        """Switch to RTXDI rendering for inference"""
+        if self.rtxdi_render_graph is None:
+            self.setup_rtxdi_render_graph()
+
+        self.testbed.render_graph = self.rtxdi_render_graph
+        if self.verbose:
+            print("Switched to RTXDI rendering")
+
+    def switch_to_basic_rendering(self):
+        """Switch back to basic rasterization for training"""
+        self.testbed.render_graph = self.render_graph
+        if self.verbose:
+            print("Switched to basic rasterization")
+
     def sample_camera_params_random(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         """Sample random camera parameters and return (position, direction, 5D_input, pdf)"""
         # Sample random position
@@ -662,87 +705,130 @@ class BasicRasterizer:
         # Get outputs and convert to PyTorch via numpy
         outputs = {}
 
-        # Get diffuse buffer - keep on CPU to save GPU memory
-        diffuse_buffer = self.render_graph.get_output("GBufferRaster.diffuseOpacity")
-        if diffuse_buffer is not None:
-            diffuse_numpy = diffuse_buffer.to_numpy()[:, :, :3]  # RGB only
-            # Keep on CPU to save GPU memory
-            outputs['diffuse'] = torch.from_numpy(diffuse_numpy)
+        # Check which render graph is active
+        is_rtxdi = (self.testbed.render_graph == self.rtxdi_render_graph)
 
-        # Get depth buffer - temporarily move to GPU for processing, then back to CPU
-        depth_buffer = self.render_graph.get_output("GBufferRaster.depth")
-        depth_tensor_gpu = None
-        if depth_buffer is not None:
-            depth_numpy = depth_buffer.to_numpy()
-            if torch.cuda.is_available():
-                depth_tensor_gpu = torch.from_numpy(depth_numpy).cuda()
-            else:
-                depth_tensor_gpu = torch.from_numpy(depth_numpy)
-            # Store CPU version to save memory
-            outputs['depth'] = torch.from_numpy(depth_numpy)
+        if is_rtxdi:
+            # RTXDI rendering - get tone mapped output for Mistral
+            tone_mapped_buffer = self.testbed.render_graph.get_output("ToneMapper.dst")
+            if tone_mapped_buffer is not None:
+                tone_mapped_numpy = tone_mapped_buffer.to_numpy()
 
-        # Get linear Z buffer - keep on CPU
-        linear_z_buffer = self.render_graph.get_output("GBufferRaster.linearZ")
-        if linear_z_buffer is not None:
-            linear_z_numpy = linear_z_buffer.to_numpy()
-            outputs['linear_z'] = torch.from_numpy(linear_z_numpy)
-
-        # Get normal buffer for back-face detection - temporarily move to GPU for processing
-        normal_buffer = self.render_graph.get_output("GBufferRaster.guideNormalW")
-        normal_tensor_gpu = None
-        if normal_buffer is not None:
-            normal_numpy = normal_buffer.to_numpy()[:, :, :3]  # Only XYZ components
-            if torch.cuda.is_available():
-                normal_tensor_gpu = torch.from_numpy(normal_numpy).cuda()
-            else:
-                normal_tensor_gpu = torch.from_numpy(normal_numpy)
-            # Store CPU version to save memory
-            outputs['normals'] = torch.from_numpy(normal_numpy)
-
-        # Calculate surface area using depth buffer
-        surface_area = 0.0
-        surface_area_stats = {}
-
-        if depth_tensor_gpu is not None:
-            try:
-                # Convert depth to world coordinates (using GPU tensor for processing)
-                world_coords, valid_mask = self.depth_to_world_coordinates(depth_tensor_gpu, camera_info)
-
-                if world_coords is not None and valid_mask is not None:
-                    # Estimate surface area using the surface area calculator with signed area
-                    surface_area, surface_area_stats, final_valid_mask = self.surface_area_calculator.estimate_surface_area_signed(
-                        world_coords, valid_mask, normal_tensor_gpu, camera_info
-                    )
-
-                    # Don't store the final_valid_mask to save memory
-                    # outputs['valid_mask'] = final_valid_mask
-
+                # Handle different output shapes from ToneMapper
+                if len(tone_mapped_numpy.shape) == 3:
+                    # Standard 3D array (H, W, C)
+                    tone_mapped_numpy = tone_mapped_numpy[:, :, :3]  # RGB only
+                elif len(tone_mapped_numpy.shape) == 2:
+                    # 2D array (H, W) - grayscale, convert to RGB
+                    tone_mapped_numpy = np.stack([tone_mapped_numpy] * 3, axis=-1)
+                elif len(tone_mapped_numpy.shape) == 1:
+                    # 1D array - reshape to image dimensions
+                    expected_size = self.render_width * self.render_height * 3
+                    if tone_mapped_numpy.size == expected_size:
+                        tone_mapped_numpy = tone_mapped_numpy.reshape(self.render_height, self.render_width, 3)
+                    elif tone_mapped_numpy.size == self.render_width * self.render_height:
+                        # Grayscale data
+                        tone_mapped_numpy = tone_mapped_numpy.reshape(self.render_height, self.render_width)
+                        tone_mapped_numpy = np.stack([tone_mapped_numpy] * 3, axis=-1)
+                    else:
+                        # Fallback: create a black image
+                        if self.verbose:
+                            print(f"Warning: Unexpected ToneMapper output size {tone_mapped_numpy.size}, expected {expected_size}")
+                        tone_mapped_numpy = np.zeros((self.render_height, self.render_width, 3), dtype=np.float32)
+                else:
+                    # Unexpected shape - create a black image
                     if self.verbose:
-                        print(f"    Signed surface area: {surface_area:.6f}")
-                        if surface_area_stats:
-                            print(f"    Pixels after filtering: {surface_area_stats.get('pixels_after_area_filter', 0)}")
-                            print(f"    Filter ratio: {surface_area_stats.get('area_filter_ratio', 0.0):.3f}")
-                            print(f"    Front-facing ratio: {surface_area_stats.get('front_facing_ratio', 0.0):.3f}")
-                            front_pixels = surface_area_stats.get('front_facing_pixels', 0)
-                            back_pixels = surface_area_stats.get('back_facing_pixels', 0)
-                            print(f"    Front-facing pixels: {front_pixels}, Back-facing pixels: {back_pixels}")
+                        print(f"Warning: Unexpected ToneMapper output shape {tone_mapped_numpy.shape}")
+                    tone_mapped_numpy = np.zeros((self.render_height, self.render_width, 3), dtype=np.float32)
 
-                # Clean up GPU tensors immediately
-                del world_coords, valid_mask
-                if 'final_valid_mask' in locals():
-                    del final_valid_mask
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                outputs['diffuse'] = torch.from_numpy(tone_mapped_numpy)
 
-            except Exception as e:
-                print(f"Error calculating surface area: {e}")
-                surface_area = 0.0
+            # For RTXDI, we don't calculate surface area (used for training only)
+            surface_area = 0.0
+            surface_area_stats = {}
+        else:
+            # Basic rasterization - get all buffers for surface area calculation
+            # Get diffuse buffer - keep on CPU to save GPU memory
+            diffuse_buffer = self.render_graph.get_output("GBufferRaster.diffuseOpacity")
+            if diffuse_buffer is not None:
+                diffuse_numpy = diffuse_buffer.to_numpy()[:, :, :3]  # RGB only
+                # Keep on CPU to save GPU memory
+                outputs['diffuse'] = torch.from_numpy(diffuse_numpy)
 
-        # Clean up GPU tensors
-        if depth_tensor_gpu is not None:
-            del depth_tensor_gpu
-        if normal_tensor_gpu is not None:
-            del normal_tensor_gpu
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            # Get depth buffer - temporarily move to GPU for processing, then back to CPU
+            depth_buffer = self.render_graph.get_output("GBufferRaster.depth")
+            depth_tensor_gpu = None
+            if depth_buffer is not None:
+                depth_numpy = depth_buffer.to_numpy()
+                if torch.cuda.is_available():
+                    depth_tensor_gpu = torch.from_numpy(depth_numpy).cuda()
+                else:
+                    depth_tensor_gpu = torch.from_numpy(depth_numpy)
+                # Store CPU version to save memory
+                outputs['depth'] = torch.from_numpy(depth_numpy)
+
+            # Get linear Z buffer - keep on CPU
+            linear_z_buffer = self.render_graph.get_output("GBufferRaster.linearZ")
+            if linear_z_buffer is not None:
+                linear_z_numpy = linear_z_buffer.to_numpy()
+                outputs['linear_z'] = torch.from_numpy(linear_z_numpy)
+
+            # Get normal buffer for back-face detection - temporarily move to GPU for processing
+            normal_buffer = self.render_graph.get_output("GBufferRaster.guideNormalW")
+            normal_tensor_gpu = None
+            if normal_buffer is not None:
+                normal_numpy = normal_buffer.to_numpy()[:, :, :3]  # Only XYZ components
+                if torch.cuda.is_available():
+                    normal_tensor_gpu = torch.from_numpy(normal_numpy).cuda()
+                else:
+                    normal_tensor_gpu = torch.from_numpy(normal_numpy)
+                # Store CPU version to save memory
+                outputs['normals'] = torch.from_numpy(normal_numpy)
+
+            # Calculate surface area using depth buffer
+            surface_area = 0.0
+            surface_area_stats = {}
+
+            if depth_tensor_gpu is not None:
+                try:
+                    # Convert depth to world coordinates (using GPU tensor for processing)
+                    world_coords, valid_mask = self.depth_to_world_coordinates(depth_tensor_gpu, camera_info)
+
+                    if world_coords is not None and valid_mask is not None:
+                        # Estimate surface area using the surface area calculator with signed area
+                        surface_area, surface_area_stats, final_valid_mask = self.surface_area_calculator.estimate_surface_area_signed(
+                            world_coords, valid_mask, normal_tensor_gpu, camera_info
+                        )
+
+                        # Don't store the final_valid_mask to save memory
+                        # outputs['valid_mask'] = final_valid_mask
+
+                        if self.verbose:
+                            print(f"    Signed surface area: {surface_area:.6f}")
+                            if surface_area_stats:
+                                print(f"    Pixels after filtering: {surface_area_stats.get('pixels_after_area_filter', 0)}")
+                                print(f"    Filter ratio: {surface_area_stats.get('area_filter_ratio', 0.0):.3f}")
+                                print(f"    Front-facing ratio: {surface_area_stats.get('front_facing_ratio', 0.0):.3f}")
+                                front_pixels = surface_area_stats.get('front_facing_pixels', 0)
+                                back_pixels = surface_area_stats.get('back_facing_pixels', 0)
+                                print(f"    Front-facing pixels: {front_pixels}, Back-facing pixels: {back_pixels}")
+
+                    # Clean up GPU tensors immediately
+                    del world_coords, valid_mask
+                    if 'final_valid_mask' in locals():
+                        del final_valid_mask
+                    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+                except Exception as e:
+                    print(f"Error calculating surface area: {e}")
+                    surface_area = 0.0
+
+            # Clean up GPU tensors
+            if depth_tensor_gpu is not None:
+                del depth_tensor_gpu
+            if normal_tensor_gpu is not None:
+                del normal_tensor_gpu
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
         # Track timing and surface area
         render_time = time.time() - start_time
@@ -961,27 +1047,68 @@ class BasicRasterizer:
         self._print_performance_stats()
         return results
 
+    def tensor_to_temp_image(self, tensor: torch.Tensor) -> str:
+        """Convert tensor to temporary image file (for disk-based approach)"""
+        # Ensure tensor is on CPU
+        if tensor.is_cuda:
+            tensor = tensor.cpu()
+
+        # Convert to numpy and ensure correct range [0, 1] -> [0, 255]
+        if tensor.dtype == torch.float32 or tensor.dtype == torch.float64:
+            np_array = (torch.clamp(tensor, 0, 1) * 255).byte().numpy()
+        else:
+            np_array = tensor.numpy()
+
+        # Ensure correct shape (H, W, C)
+        if len(np_array.shape) == 3 and np_array.shape[2] >= 3:
+            np_array = np_array[:, :, :3]  # Take RGB only
+
+        # Convert to PIL Image and save to temp file
+        pil_image = Image.fromarray(np_array, mode='RGB')
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        pil_image.save(temp_file.name, quality=95)
+        return temp_file.name
+
+
+
     async def check_target_in_image(self, tensor: torch.Tensor, sample_id: int) -> bool:
-        """Check if target object is in the rendered image using direct tensor processing"""
+        """Check if target object is in the rendered image (supports both direct tensor and disk-based approaches)"""
         if not self.enable_mistral:
             return False
 
         try:
-            # Use the async API to check for object directly from tensor (no disk I/O)
-            result = await self.mistral_api.check_object_presence_from_tensor_async(
-                tensor, self.target_object
-            )
+            if self.use_direct_tensor:
+                # Optimized approach: send tensor directly to Mistral (no disk I/O)
+                result = await self.mistral_api.check_object_presence_from_tensor_async(
+                    tensor, self.target_object, sample_id=sample_id
+                )
+            else:
+                # Traditional approach: save to temp file first
+                temp_image_path = self.tensor_to_temp_image(tensor)
+                try:
+                    result = await self.mistral_api.check_object_presence_async(
+                        temp_image_path, self.target_object, sample_id=sample_id
+                    )
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_image_path):
+                        os.remove(temp_image_path)
 
             self.inference_iterations += 1
 
             if self.verbose:
-                print(f"  Sample {sample_id}: {result.response_text} -> {result.is_present}")
+                method = "direct-tensor" if self.use_direct_tensor else "disk-based"
+                print(f"  Sample {sample_id} ({method}): {result.response_text} -> {result.is_present}")
 
             return result.is_present
 
         except Exception as e:
             if self.verbose:
-                print(f"  Error checking target in sample {sample_id}: {e}")
+                method = "direct-tensor" if self.use_direct_tensor else "disk-based"
+                print(f"  Error checking target in sample {sample_id} ({method}): {e}")
+
+
+
             return False
 
     def save_target_image(self, tensor: torch.Tensor, sample_id: int) -> str:
@@ -1057,8 +1184,7 @@ class BasicRasterizer:
                     self.targets_found_count = 0
                 self.targets_found_count += 1
             else:
-                if self.verbose:
-                    print(f"  Sample {sample_id}: No target detected")
+                print(f"Sample {sample_id}: Target not found (inference #{self.inference_iterations})")
 
         result = {
             'sample_id': sample_id,
@@ -1083,8 +1209,12 @@ class BasicRasterizer:
             print(f"Looking for target: '{self.target_object}'")
             print(f"Using pretrained NFSampler: {self.is_nf_trained}")
 
+        # Switch to RTXDI rendering for better quality inference images
+        if self.enable_mistral:
+            self.switch_to_rtxdi_rendering()
+
         # Set sliding window size
-        window_size = 1924 if self.enable_mistral else 1
+        window_size = 16 if self.enable_mistral else 1
         if self.verbose:
             print(f"Sliding window size: {window_size}")
 
@@ -1109,6 +1239,10 @@ class BasicRasterizer:
         if tasks:
             completed_results = await asyncio.gather(*tasks)
             results.extend(completed_results)
+
+        # Switch back to basic rendering after inference
+        if self.enable_mistral:
+            self.switch_to_basic_rendering()
 
         # Print final summary
         if self.enable_mistral:
@@ -1445,7 +1579,24 @@ class BasicRasterizer:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="Basic Falcor Rasterizer with NFSampler and Mistral API")
+    parser = argparse.ArgumentParser(
+        description="Basic Falcor Rasterizer with NFSampler and Mistral API",
+        epilog="""
+            Examples:
+            # Use optimized direct tensor processing (default, fastest):
+            python basic_rasterizer.py --enable_mistral --target_object "car" --mode inference
+
+            # Use traditional disk-based approach (slower but more compatible):
+            python basic_rasterizer.py --enable_mistral --target_object "car" --mode inference --use_disk_io
+
+            # Full training + inference workflow with direct tensor processing:
+            python basic_rasterizer.py --mode both --enable_mistral --target_object "thread with a needle"
+
+            # Enable debug mode to save all requests for analysis:
+            python basic_rasterizer.py --enable_mistral --target_object "car" --mode inference --debug_folder "mistral_debug"
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--scene-file",  default="C:/Users/devmi/OneDrive/Documents/Bistro_v5_2/Bistro_v5_2/BistroOur.fbx", help="Path to scene file (.pyscene, .fbx, .gltf, etc.)")
     parser.add_argument("--num_samples", type=int, default=500, help="Number of samples to render")
     parser.add_argument("--width", type=int, default=512, help="Render width")
@@ -1466,6 +1617,8 @@ async def main():
     parser.add_argument("--weights_file", type=str, default="nf_weights.pth", help="Path to save/load NFSampler weights")
     parser.add_argument("--enable_mistral", action="store_true", help="Enable Mistral API for target detection")
     parser.add_argument("--target_object", type=str, default="target", help="Object to search for with Mistral API")
+    parser.add_argument("--use_disk_io", action="store_true", help="Use disk-based approach (save temp files) instead of direct tensor processing")
+    parser.add_argument("--debug_folder", type=str, default=None, help="Save all Mistral requests (images + prompts) to this folder for debugging")
 
     args = parser.parse_args()
 
@@ -1487,7 +1640,9 @@ async def main():
         viz_every_n_steps=args.viz_every_n_steps,
         viz_resolution=args.viz_resolution,
         enable_mistral=args.enable_mistral,
-        target_object=args.target_object
+        target_object=args.target_object,
+        use_direct_tensor=not args.use_disk_io,  # Invert the flag: --use_disk_io disables direct tensor
+        debug_folder=args.debug_folder
     )
 
     try:
@@ -1495,6 +1650,7 @@ async def main():
         renderer.setup_falcor()
         renderer.load_scene(args.scene_file)
         renderer.setup_render_graph()
+        renderer.setup_rtxdi_render_graph()
 
         results = []
 

@@ -3,6 +3,8 @@
 
 # Test output folder.
 /tests/data/
+/mistral_debug/
+/target_images/
 
 # Media folders.
 /media

@@ -26,7 +26,7 @@ class ObjectCheckResult:
 class AsyncMistralVisionAPI:
     """Simple async Mistral Vision API for yes/no object detection."""
 
-    def __init__(self, api_key: Optional[str] = "WPu0KpNOAUFviCzNgnbWQuRbz7Zpwyde", config_path: str = "config.json", patterns_file: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = "WPu0KpNOAUFviCzNgnbWQuRbz7Zpwyde", config_path: str = "config.json", patterns_file: Optional[str] = None, debug_folder: Optional[str] = None):
         """Initialize the async Mistral Vision API client."""
         self.api_key = api_key or os.getenv("MISTRAL_API_KEY")
         if not self.api_key:
@@ -40,6 +40,27 @@ class AsyncMistralVisionAPI:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
+
+        # Setup debug folder if specified
+        self.debug_folder = debug_folder
+        if self.debug_folder:
+            import shutil
+            from pathlib import Path
+            self.debug_folder_path = Path(self.debug_folder)
+
+            # Clean and recreate debug folder
+            if self.debug_folder_path.exists():
+                shutil.rmtree(self.debug_folder_path)
+                print(f"🗑️  Cleaned existing debug folder: {self.debug_folder_path}")
+
+            self.debug_folder_path.mkdir(parents=True, exist_ok=True)
+            print(f"📁 Mistral debug folder created: {self.debug_folder_path}")
+            print(f"🔍 Debug mode ENABLED - all Mistral requests will be saved!")
+        else:
+            self.debug_folder_path = None
+            print("🔍 Debug mode DISABLED - no debug files will be saved")
+
+        self.request_counter = 0  # Counter for debug file naming
 
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from JSON file."""
@@ -77,13 +98,18 @@ class AsyncMistralVisionAPI:
         import io
         from PIL import Image
 
+        # Import torch at the beginning to avoid reference before assignment
+        try:
+            import torch
+        except ImportError:
+            torch = None
+
         # Ensure tensor is on CPU
         if hasattr(tensor, 'is_cuda') and tensor.is_cuda:
             tensor = tensor.cpu()
 
         # Convert to numpy and ensure correct range [0, 1] -> [0, 255]
-        if hasattr(tensor, 'dtype') and (tensor.dtype == torch.float32 or tensor.dtype == torch.float64):
-            import torch
+        if hasattr(tensor, 'dtype') and torch and (tensor.dtype == torch.float32 or tensor.dtype == torch.float64):
             np_array = (torch.clamp(tensor, 0, 1) * 255).byte().numpy()
         else:
             np_array = tensor.numpy() if hasattr(tensor, 'numpy') else tensor
@@ -124,11 +150,57 @@ class AsyncMistralVisionAPI:
 
         return is_present, confidence
 
-    async def run_vision_inference(self, image_path: str, prompt: str) -> dict:
+    def _save_debug_request(self, image_base64: str, prompt: str, response_text: str = None, sample_id: int = None) -> None:
+        """Save debug information for the exact request sent to Mistral"""
+        if not self.debug_folder_path:
+            return
+
+        try:
+            import datetime
+            import base64
+
+            # Use sample_id if provided, otherwise use internal counter
+            if sample_id is not None:
+                file_prefix = f"sample_{sample_id:04d}"
+            else:
+                self.request_counter += 1
+                file_prefix = f"request_{self.request_counter:04d}"
+
+            # Save the exact image that goes to Mistral
+            debug_image_path = self.debug_folder_path / f"{file_prefix}_mistral_image.jpeg"
+            image_data = base64.b64decode(image_base64)
+            with open(debug_image_path, 'wb') as f:
+                f.write(image_data)
+
+            # Save request details
+            debug_text_path = self.debug_folder_path / f"{file_prefix}_mistral_request.txt"
+            with open(debug_text_path, 'w', encoding='utf-8') as f:
+                f.write(f"=== MISTRAL API REQUEST DEBUG ===\n")
+                f.write(f"Timestamp: {datetime.datetime.now().isoformat()}\n")
+                if sample_id is not None:
+                    f.write(f"Sample ID: {sample_id}\n")
+                f.write(f"Request Counter: {self.request_counter}\n")
+                f.write(f"Model: {self.config['model']}\n")
+                f.write(f"Max Tokens: {self.config['max_tokens']}\n")
+                f.write(f"Temperature: {self.config['temperature']}\n")
+                f.write(f"Image Size (bytes): {len(image_data)}\n")
+                f.write(f"\nPrompt Sent to Mistral:\n{prompt}\n")
+                if response_text:
+                    f.write(f"\nResponse from Mistral:\n{response_text}\n")
+                f.write(f"\n=== END DEBUG INFO ===\n")
+
+        except Exception as e:
+            print(f"❌ ERROR: Failed to save Mistral debug info: {e}")
+
+    async def run_vision_inference(self, image_path: str, prompt: str, sample_id: int = None) -> dict:
         """Run vision inference on an image asynchronously."""
         # Encode image to base64
         image_base64 = self.encode_image_to_base64(image_path)
 
+        # Save debug info before making request
+        if self.debug_folder_path:
+            self._save_debug_request(image_base64, prompt, sample_id=sample_id)
+
         # Prepare the request payload
         payload = {
             "model": self.config["model"],
@@ -163,16 +235,35 @@ class AsyncMistralVisionAPI:
                 json=payload
             )
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+                # Update debug info with response
+                if self.debug_folder_path and "choices" in result and len(result["choices"]) > 0:
+                    response_text = result["choices"][0]["message"]["content"]
+                    self._save_debug_request(image_base64, prompt, response_text, sample_id)
+                return result
             else:
-                raise Exception(f"API request failed with status {response.status_code}: {response.text}")
+                error_msg = f"API request failed with status {response.status_code}: {response.text}"
+                # Save debug info with error
+                if self.debug_folder_path:
+                    self._save_debug_request(image_base64, prompt, f"ERROR: {error_msg}", sample_id)
+                raise Exception(error_msg)
 
         return await loop.run_in_executor(None, make_request)
 
-    async def run_vision_inference_from_tensor(self, tensor, prompt: str) -> dict:
+    async def run_vision_inference_from_tensor(self, tensor, prompt: str, sample_id: int = None) -> dict:
         """Run vision inference on a tensor directly without disk I/O."""
         # Convert tensor directly to base64
-        image_base64 = self.tensor_to_base64(tensor)
+        try:
+            image_base64 = self.tensor_to_base64(tensor)
+        except Exception as e:
+            print(f"❌ ERROR: Failed to convert tensor to base64: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+        # Save debug info before making request
+        if self.debug_folder_path:
+            self._save_debug_request(image_base64, prompt, sample_id=sample_id)
 
         # Prepare the request payload
         payload = {
@@ -208,13 +299,22 @@ class AsyncMistralVisionAPI:
                 json=payload
             )
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+                # Update debug info with response
+                if self.debug_folder_path and "choices" in result and len(result["choices"]) > 0:
+                    response_text = result["choices"][0]["message"]["content"]
+                    self._save_debug_request(image_base64, prompt, response_text, sample_id)
+                return result
             else:
-                raise Exception(f"API request failed with status {response.status_code}: {response.text}")
+                error_msg = f"API request failed with status {response.status_code}: {response.text}"
+                # Save debug info with error
+                if self.debug_folder_path:
+                    self._save_debug_request(image_base64, prompt, f"ERROR: {error_msg}", sample_id)
+                raise Exception(error_msg)
 
         return await loop.run_in_executor(None, make_request)
 
-    async def check_object_presence_async(self, image_path: str, object_name: str, prompt: Optional[str] = None) -> ObjectCheckResult:
+    async def check_object_presence_async(self, image_path: str, object_name: str, prompt: Optional[str] = None, sample_id: int = None) -> ObjectCheckResult:
         """
         Check for object presence in an image asynchronously.
 
@@ -228,7 +328,7 @@ class AsyncMistralVisionAPI:
         """
         start_time = time.time()
 
-                        # Generate prompt if not provided
+        # Generate prompt if not provided
         if prompt is None:
             prompt = f"Is there a clearly recognizable {object_name} in the image?"
 
@@ -237,7 +337,7 @@ class AsyncMistralVisionAPI:
 
         try:
             # Run the inference
-            result = await self.run_vision_inference(image_path, simple_prompt)
+            result = await self.run_vision_inference(image_path, simple_prompt, sample_id)
 
             # Extract the response text
             if "choices" in result and len(result["choices"]) > 0:
@@ -273,7 +373,7 @@ class AsyncMistralVisionAPI:
                 prompt_used=simple_prompt
             )
 
-    async def check_object_presence_from_tensor_async(self, tensor, object_name: str, prompt: Optional[str] = None) -> ObjectCheckResult:
+    async def check_object_presence_from_tensor_async(self, tensor, object_name: str, prompt: Optional[str] = None, sample_id: int = None) -> ObjectCheckResult:
         """
         Check for object presence in a tensor directly without disk I/O.
 
@@ -296,7 +396,7 @@ class AsyncMistralVisionAPI:
 
         try:
             # Run the inference directly from tensor
-            result = await self.run_vision_inference_from_tensor(tensor, simple_prompt)
+            result = await self.run_vision_inference_from_tensor(tensor, simple_prompt, sample_id)
 
             # Extract the response text
             if "choices" in result and len(result["choices"]) > 0:
