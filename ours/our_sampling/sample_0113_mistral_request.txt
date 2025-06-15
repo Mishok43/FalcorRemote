@@ -1,0 +1,16 @@
+=== MISTRAL API REQUEST DEBUG ===
+Timestamp: 2025-06-15T14:40:31.352952
+Sample ID: 113
+Request Counter: 0
+Model: pixtral-12b-2409
+Max Tokens: 1000
+Temperature: 0.7
+Image Size (bytes): 116471
+
+Prompt Sent to Mistral:
+Look at this image and answer only 'yes' or 'no': Is there a clearly recognizable window in the image?. Only claim it if there's the object if you're 99% confident.
+
+Response from Mistral:
+No.
+
+=== END DEBUG INFO ===

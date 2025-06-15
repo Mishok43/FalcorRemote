@@ -13,6 +13,7 @@ import datetime
 import asyncio
 import tempfile
 from PIL import Image
+from nf_sampler import NFSampler
 
 # Add the scripts directory to path for common module
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +29,6 @@ import falcor
 from falcor import float3, uint2
 import common
 from surface_area_worker import SurfaceAreaCalculator
-from nf_sampler import NFSampler
 from predetermined_sampler import PredeterminedSampler
 
 # Import async Mistral functionality
@@ -145,6 +145,7 @@ class BasicRasterizer:
         self.training_data = []  # Store (5D_input, surface_area) pairs
         self.sample_count = 0
         self.is_nf_trained = False
+        self._latest_checkpoint = None  # Track latest checkpoint file
 
         # PredeterminedSampler for batch efficiency
         self.predetermined_sampler = None
@@ -797,10 +798,16 @@ class BasicRasterizer:
                 # Store CPU version to save memory
                 outputs['depth'] = torch.from_numpy(depth_numpy)
 
-            # Get linear Z buffer - keep on CPU
+            # Get linear Z buffer - temporarily move to GPU for processing, then back to CPU
             linear_z_buffer = self.render_graph.get_output("GBufferRaster.linearZ")
+            linear_z_tensor_gpu = None
             if linear_z_buffer is not None:
                 linear_z_numpy = linear_z_buffer.to_numpy()
+                if torch.cuda.is_available():
+                    linear_z_tensor_gpu = torch.from_numpy(linear_z_numpy).cuda()
+                else:
+                    linear_z_tensor_gpu = torch.from_numpy(linear_z_numpy)
+                # Store CPU version to save memory
                 outputs['linear_z'] = torch.from_numpy(linear_z_numpy)
 
             # Get normal buffer for back-face detection - temporarily move to GPU for processing
@@ -815,19 +822,26 @@ class BasicRasterizer:
                 # Store CPU version to save memory
                 outputs['normals'] = torch.from_numpy(normal_numpy)
 
-            # Calculate surface area using depth buffer
+            # Calculate surface area using linearZ buffer
             surface_area = 0.0
             surface_area_stats = {}
 
-            if depth_tensor_gpu is not None:
+            if linear_z_tensor_gpu is not None:
                 try:
-                    # Use simple surface area calculation by default (counts visible surfaces)
-                    surface_area = self.calculate_simple_surface_area(depth_tensor_gpu)
+                    # Use simple surface area calculation by default (counts non-zero elements in linearZ first channel)
+                    surface_area = self.calculate_simple_surface_area(linear_z_tensor_gpu)
+
+                    # Calculate total pixels from linearZ tensor shape
+                    if len(linear_z_tensor_gpu.shape) == 3:
+                        total_pixels = linear_z_tensor_gpu.shape[0] * linear_z_tensor_gpu.shape[1]
+                    else:
+                        total_pixels = linear_z_tensor_gpu.numel()
+
                     surface_area_stats = {
-                        'method': 'simple_surface_count',
+                        'method': 'simple_surface_count_linearZ',
                         'visible_surface_ratio': surface_area,
-                        'total_pixels': depth_tensor_gpu.numel(),
-                        'visible_pixels': int(surface_area * depth_tensor_gpu.numel())
+                        'total_pixels': total_pixels,
+                        'visible_pixels': int(surface_area * total_pixels)
                     }
 
                     if self.verbose:
@@ -853,6 +867,8 @@ class BasicRasterizer:
             # Clean up GPU tensors
             if depth_tensor_gpu is not None:
                 del depth_tensor_gpu
+            if linear_z_tensor_gpu is not None:
+                del linear_z_tensor_gpu
             if normal_tensor_gpu is not None:
                 del normal_tensor_gpu
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -892,7 +908,7 @@ class BasicRasterizer:
             self.generate_predetermined_samples()
 
     def train_nf_sampler(self):
-        """Train the NFSampler with accumulated data"""
+        """Train the NFSampler with accumulated data with improved checkpoint management"""
         if not self.use_nf_sampler or len(self.training_data) < self.train_batch_size:
             return
 
@@ -907,9 +923,14 @@ class BasicRasterizer:
         # Add data to NFSampler (note: NFSampler wants to minimize y, but we want to maximize surface area)
         # So we use negative surface area as the loss
 
+        # Create checkpoint filename with timestamp
+        import time
+        timestamp = int(time.time())
+        checkpoint_file = f"nf_checkpoint_{timestamp}_{len(self.training_data)}.pth"
+        backup_file = "nf_weights_backup_before_fit.pth"
+
         try:
-            # Save weights before training (backup)
-            backup_file = "nf_weights_backup_before_fit.pth"
+            # Save checkpoint before training (backup current state)
             if self.is_nf_trained:
                 try:
                     self.save_nf_weights(backup_file)
@@ -924,15 +945,27 @@ class BasicRasterizer:
             self.nf_sampler.fit()
             self.is_nf_trained = True
 
-            # Save weights after successful training
-            checkpoint_file = f"nf_weights_after_fit_{len(self.training_data)}.pth"
+            # Save checkpoint after successful training
             try:
                 self.save_nf_weights(checkpoint_file)
                 if self.verbose:
-                    print(f"✅ Weights saved after successful fit: {checkpoint_file}")
+                    print(f"✅ Checkpoint saved after successful fit: {checkpoint_file}")
+
+                # Update the latest checkpoint reference
+                self._latest_checkpoint = checkpoint_file
+
+                # Clean up old backup file since we have a new checkpoint
+                if os.path.exists(backup_file):
+                    try:
+                        os.remove(backup_file)
+                        if self.verbose:
+                            print(f"🗑️  Cleaned up backup file: {backup_file}")
+                    except Exception:
+                        pass  # Ignore cleanup errors
+
             except Exception as save_e:
                 if self.verbose:
-                    print(f"⚠️  Warning: Could not save weights after fit: {save_e}")
+                    print(f"⚠️  Warning: Could not save checkpoint: {save_e}")
 
             if self.verbose:
                 print(f"NFSampler training complete. Model is now active for sampling.")
@@ -949,22 +982,38 @@ class BasicRasterizer:
 
         except Exception as e:
             print(f"❌ Error training NFSampler: {e}")
+            import traceback
+            traceback.print_exc()
 
-            # Try to recover from backup if available
-            backup_file = "nf_weights_backup_before_fit.pth"
+            # Try to recover from the most recent checkpoint
+            recovery_successful = False
+
+            # First try to recover from backup
             if os.path.exists(backup_file) and self.is_nf_trained:
                 try:
                     print(f"🔄 Attempting to recover from backup: {backup_file}")
                     self.load_nf_weights(backup_file, load_training_data=False)
                     print(f"✅ Successfully recovered from backup")
+                    recovery_successful = True
                 except Exception as recovery_e:
                     print(f"❌ Failed to recover from backup: {recovery_e}")
-                    # Reset training status if recovery fails
-                    self.is_nf_trained = False
-            else:
-                # No backup available or not previously trained
+
+            # If backup recovery failed, try to find the latest checkpoint
+            if not recovery_successful:
+                latest_checkpoint = self._find_latest_checkpoint()
+                if latest_checkpoint and os.path.exists(latest_checkpoint):
+                    try:
+                        print(f"🔄 Attempting to recover from latest checkpoint: {latest_checkpoint}")
+                        self.load_nf_weights(latest_checkpoint, load_training_data=False)
+                        print(f"✅ Successfully recovered from checkpoint")
+                        recovery_successful = True
+                    except Exception as recovery_e:
+                        print(f"❌ Failed to recover from checkpoint: {recovery_e}")
+
+            # If all recovery attempts failed
+            if not recovery_successful:
                 self.is_nf_trained = False
-                print(f"⚠️  No backup available. NFSampler training disabled.")
+                print(f"⚠️  No recovery possible. NFSampler training disabled.")
 
             # Clean up GPU memory even on error
             if torch.cuda.is_available():
@@ -1595,6 +1644,26 @@ class BasicRasterizer:
         self.viz_step_counter += 1
         return self.viz_step_counter % self.viz_every_n_steps == 0
 
+    def _find_latest_checkpoint(self) -> Optional[str]:
+        """Find the most recent checkpoint file"""
+        import glob
+
+        # Look for checkpoint files in current directory
+        checkpoint_pattern = "nf_checkpoint_*.pth"
+        checkpoint_files = glob.glob(checkpoint_pattern)
+
+        if not checkpoint_files:
+            return None
+
+        # Sort by modification time (most recent first)
+        checkpoint_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+
+        latest = checkpoint_files[0]
+        if self.verbose:
+            print(f"Found latest checkpoint: {latest}")
+
+        return latest
+
     def save_nf_weights(self, filepath: str):
         """
         Save NFSampler weights and training data
@@ -1685,29 +1754,41 @@ class BasicRasterizer:
 
         return stats
 
-    def calculate_simple_surface_area(self, depth_tensor, depth_epsilon=0.001):
+    def calculate_simple_surface_area(self, linear_z_tensor, depth_epsilon=0.001):
         """
-        Simple surface area calculation that counts visible surfaces (pixels with valid depth).
+        Simple surface area calculation that counts non-zero elements in linearZ buffer first channel.
         This maximizes sampling of camera locations that show the most surfaces rather than sky.
 
         Args:
-            depth_tensor: Depth buffer tensor [H, W]
-            depth_epsilon: Minimum depth threshold to consider a pixel as showing a surface
+            linear_z_tensor: LinearZ buffer tensor [H, W] or [H, W, C]
+            depth_epsilon: Unused parameter (kept for compatibility)
 
         Returns:
-            float: Number of visible surface pixels (normalized by total pixels)
+            float: Number of non-zero surface pixels (normalized by total pixels)
         """
         try:
-            if depth_tensor is None:
+            if linear_z_tensor is None:
                 return 0.0
 
-            # Count pixels with depth greater than epsilon (showing actual surfaces, not sky)
-            valid_depth_mask = depth_tensor > depth_epsilon
-            visible_surface_pixels = torch.sum(valid_depth_mask).item()
+            # Handle both 2D and 3D linearZ tensors
+            if len(linear_z_tensor.shape) == 3:
+                # Multi-channel linearZ - use first channel (channel 0) only
+                linear_z_first_channel = linear_z_tensor[:, :, 0]
+            elif len(linear_z_tensor.shape) == 2:
+                # Single channel linearZ
+                linear_z_first_channel = linear_z_tensor
+            else:
+                if self.verbose:
+                    print(f"Unexpected linearZ tensor shape: {linear_z_tensor.shape}")
+                return 0.0
+
+            # Count pixels where first channel of linearZ is not zero (showing actual surfaces)
+            non_zero_mask = linear_z_first_channel != 0.0
+            non_zero_pixels = torch.sum(non_zero_mask).item()
 
             # Normalize by total pixels to get a ratio [0, 1]
-            total_pixels = depth_tensor.numel()
-            surface_ratio = visible_surface_pixels / total_pixels if total_pixels > 0 else 0.0
+            total_pixels = linear_z_first_channel.numel()
+            surface_ratio = non_zero_pixels / total_pixels if total_pixels > 0 else 0.0
 
             return surface_ratio
 
@@ -1818,12 +1899,15 @@ async def main():
 
             # Load weights if doing inference only
             if args.mode == "inference":
-                if os.path.exists(args.weights_file):
-                    renderer.load_nf_weights(args.weights_file)
-                    print(f"✅ Loaded weights from: {args.weights_file}")
+                if renderer.use_nf_sampler:
+                    if os.path.exists(args.weights_file):
+                        renderer.load_nf_weights(args.weights_file)
+                        print(f"✅ Loaded weights from: {args.weights_file}")
+                    else:
+                        print(f"❌ Weights file not found: {args.weights_file}")
+                        print("⚠️  Continuing with random sampling (no NFSampler)")
                 else:
-                    print(f"❌ Weights file not found: {args.weights_file}")
-                    print("⚠️  Continuing with random sampling (no NFSampler)")
+                    print("⚠️  NFSampler is disabled (--no_nf flag). Using random sampling only.")
 
             if not args.enable_mistral:
                 print("Warning: Mistral API not enabled. Skipping inference.")
