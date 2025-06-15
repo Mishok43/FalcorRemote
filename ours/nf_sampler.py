@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 import numpy as np
 from typing_extensions import override
 import torch
+import time
 
 # Dummy implementations for logging (removed dependencies)
 class LogCategory:
@@ -557,3 +558,158 @@ class NFSampler(DummySampler):
         except Exception as e:
             # Return 0 if evaluation fails
             return 0.0
+
+    def save_weights(self, filepath: str):
+        """
+        Save the NFSampler model weights and training data to a file
+
+        Args:
+            filepath: Path to save the weights (should end with .pth or .pt)
+        """
+        if not self.is_initialized:
+            raise Exception("NFSampler must be initialized before saving weights")
+
+        # Prepare data to save
+        save_data = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': {
+                'total_dimensions': self.total_dimensions,
+                'latent_size': self.latent_size,
+                'hidden_units': self.hidden_units,
+                'hidden_layers': self.hidden_layers,
+                'learning_rate': self.learning_rate,
+                'num_flows': self.num_flows,
+                'epochs_per_fit': self.epochs_per_fit,
+                'batch_size': self.batch_size,
+                'history_size': self.history_size,
+                'has_dummy_dimension': self.has_dummy_dimension,
+                'device': str(self.device)
+            },
+            'training_data': {
+                'all_x': self.all_x.cpu() if self.all_x is not None else None,
+                'all_x_pdf': self.all_x_pdf.cpu() if self.all_x_pdf is not None else None,
+                'all_y_unnormalized': self.all_y_unnormalized.cpu() if self.all_y_unnormalized is not None else None
+            },
+            'metadata': {
+                'save_timestamp': torch.tensor(time.time()),
+                'normflows_version': getattr(nf, '__version__', 'unknown'),
+                'torch_version': torch.__version__
+            }
+        }
+
+        # Save to file
+        torch.save(save_data, filepath)
+        print(f"NFSampler weights and data saved to: {filepath}")
+
+    def load_weights(self, filepath: str, load_training_data: bool = True):
+        """
+        Load NFSampler model weights and optionally training data from a file
+
+        Args:
+            filepath: Path to the saved weights file
+            load_training_data: Whether to load the training data as well
+        """
+        import os
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Weights file not found: {filepath}")
+
+        # Load data from file
+        save_data = torch.load(filepath, map_location=self.device, weights_only=False)
+
+        # Verify compatibility
+        config = save_data['config']
+        if config['total_dimensions'] != self.total_dimensions:
+            raise ValueError(f"Dimension mismatch: saved model has {config['total_dimensions']} dimensions, "
+                           f"current sampler has {self.total_dimensions} dimensions")
+
+        if config['latent_size'] != self.latent_size:
+            raise ValueError(f"Latent size mismatch: saved model has {config['latent_size']}, "
+                           f"current sampler has {self.latent_size}")
+
+        # Update configuration to match saved model
+        self.hidden_units = config['hidden_units']
+        self.hidden_layers = config['hidden_layers']
+        self.learning_rate = config['learning_rate']
+        self.num_flows = config['num_flows']
+        self.epochs_per_fit = config['epochs_per_fit']
+        self.batch_size = config['batch_size']
+        self.history_size = config['history_size']
+        self.has_dummy_dimension = config['has_dummy_dimension']
+
+        # Reinitialize if not already done
+        if not self.is_initialized:
+            self.reinitialize()
+
+        # Load model and optimizer states
+        self.model.load_state_dict(save_data['model_state_dict'])
+        self.optimizer.load_state_dict(save_data['optimizer_state_dict'])
+
+        # Load training data if requested
+        if load_training_data and save_data['training_data']['all_x'] is not None:
+            self.all_x = save_data['training_data']['all_x'].to(self.device)
+            self.all_x_pdf = save_data['training_data']['all_x_pdf'].to(self.device)
+            self.all_y_unnormalized = save_data['training_data']['all_y_unnormalized'].to(self.device)
+            print(f"Loaded {self.all_x.shape[0]} training samples")
+        else:
+            print("Training data not loaded (either not requested or not available)")
+
+        # Print metadata
+        metadata = save_data.get('metadata', {})
+        if 'save_timestamp' in metadata:
+            import datetime
+            save_time = datetime.datetime.fromtimestamp(metadata['save_timestamp'].item())
+            print(f"Model saved on: {save_time}")
+
+        print(f"NFSampler weights loaded from: {filepath}")
+
+    @classmethod
+    def load_from_file(cls, filepath: str, device: str = None) -> "NFSampler":
+        """
+        Create a new NFSampler instance and load weights from file
+
+        Args:
+            filepath: Path to the saved weights file
+            device: Device to load the model on (if None, uses saved device)
+
+        Returns:
+            NFSampler: New instance with loaded weights
+        """
+        import os
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Weights file not found: {filepath}")
+
+        # Load configuration from file
+        save_data = torch.load(filepath, map_location='cpu', weights_only=False)
+        config = save_data['config']
+
+        # Use saved device if not specified
+        if device is None:
+            device = config['device']
+
+        # Create new sampler with saved configuration
+        sampler = cls(
+            name=None,
+            rng=None,
+            num_flows=config['num_flows'],
+            hidden_units=config['hidden_units'],
+            hidden_layers=config['hidden_layers'],
+            learning_rate=config['learning_rate'],
+            epochs_per_fit=config['epochs_per_fit'],
+            batch_size=config['batch_size'],
+            history_size=config['history_size'],
+            latent_size=config['latent_size'],
+            device=device
+        )
+
+        # Set dimensions and initialize
+        sampler.total_dimensions = config['total_dimensions']
+        sampler.has_dummy_dimension = config['has_dummy_dimension']
+
+        # No need to register dimensions since we're setting total_dimensions directly
+        # The dimensions are already accounted for in the saved config
+
+        # Load weights
+        sampler.load_weights(filepath, load_training_data=True)
+
+        return sampler
