@@ -17,6 +17,7 @@
 # IDE folders.
 /.vs/
 /.vscode/
+*.pth
 
 # User files.
 /CMakeUserPresets.json

@@ -821,32 +821,29 @@ class BasicRasterizer:
 
             if depth_tensor_gpu is not None:
                 try:
+                    # Use simple surface area calculation by default (counts visible surfaces)
+                    surface_area = self.calculate_simple_surface_area(depth_tensor_gpu)
+                    surface_area_stats = {
+                        'method': 'simple_surface_count',
+                        'visible_surface_ratio': surface_area,
+                        'total_pixels': depth_tensor_gpu.numel(),
+                        'visible_pixels': int(surface_area * depth_tensor_gpu.numel())
+                    }
+
+                    if self.verbose:
+                        print(f"    Simple surface area (visible ratio): {surface_area:.6f}")
+                        print(f"    Visible pixels: {surface_area_stats['visible_pixels']}/{surface_area_stats['total_pixels']}")
+
+                    # Optional: Use complex surface area calculation if needed (commented out by default)
                     # Convert depth to world coordinates (using GPU tensor for processing)
-                    world_coords, valid_mask = self.depth_to_world_coordinates(depth_tensor_gpu, camera_info)
-
-                    if world_coords is not None and valid_mask is not None:
-                        # Estimate surface area using the surface area calculator with signed area
-                        surface_area, surface_area_stats, final_valid_mask = self.surface_area_calculator.estimate_surface_area_signed(
-                            world_coords, valid_mask, normal_tensor_gpu, camera_info
-                        )
-
-                        # Don't store the final_valid_mask to save memory
-                        # outputs['valid_mask'] = final_valid_mask
-
-                        if self.verbose:
-                            print(f"    Signed surface area: {surface_area:.6f}")
-                            if surface_area_stats:
-                                print(f"    Pixels after filtering: {surface_area_stats.get('pixels_after_area_filter', 0)}")
-                                print(f"    Filter ratio: {surface_area_stats.get('area_filter_ratio', 0.0):.3f}")
-                                print(f"    Front-facing ratio: {surface_area_stats.get('front_facing_ratio', 0.0):.3f}")
-                                front_pixels = surface_area_stats.get('front_facing_pixels', 0)
-                                back_pixels = surface_area_stats.get('back_facing_pixels', 0)
-                                print(f"    Front-facing pixels: {front_pixels}, Back-facing pixels: {back_pixels}")
+                    # world_coords, valid_mask = self.depth_to_world_coordinates(depth_tensor_gpu, camera_info)
+                    # if world_coords is not None and valid_mask is not None:
+                    #     # Estimate surface area using the surface area calculator with signed area
+                    #     surface_area, surface_area_stats, final_valid_mask = self.surface_area_calculator.estimate_surface_area_signed(
+                    #         world_coords, valid_mask, normal_tensor_gpu, camera_info
+                    #     )
 
                     # Clean up GPU tensors immediately
-                    del world_coords, valid_mask
-                    if 'final_valid_mask' in locals():
-                        del final_valid_mask
                     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
                 except Exception as e:
@@ -911,9 +908,31 @@ class BasicRasterizer:
         # So we use negative surface area as the loss
 
         try:
+            # Save weights before training (backup)
+            backup_file = "nf_weights_backup_before_fit.pth"
+            if self.is_nf_trained:
+                try:
+                    self.save_nf_weights(backup_file)
+                    if self.verbose:
+                        print(f"💾 Backup saved before training: {backup_file}")
+                except Exception as backup_e:
+                    if self.verbose:
+                        print(f"⚠️  Warning: Could not save backup: {backup_e}")
+
+            # Add data and fit
             self.nf_sampler.add_data(x_data, x_pdf_data, y_data)
             self.nf_sampler.fit()
             self.is_nf_trained = True
+
+            # Save weights after successful training
+            checkpoint_file = f"nf_weights_after_fit_{len(self.training_data)}.pth"
+            try:
+                self.save_nf_weights(checkpoint_file)
+                if self.verbose:
+                    print(f"✅ Weights saved after successful fit: {checkpoint_file}")
+            except Exception as save_e:
+                if self.verbose:
+                    print(f"⚠️  Warning: Could not save weights after fit: {save_e}")
 
             if self.verbose:
                 print(f"NFSampler training complete. Model is now active for sampling.")
@@ -929,10 +948,39 @@ class BasicRasterizer:
                 torch.cuda.empty_cache()
 
         except Exception as e:
-            print(f"Error training NFSampler: {e}")
+            print(f"❌ Error training NFSampler: {e}")
+
+            # Try to recover from backup if available
+            backup_file = "nf_weights_backup_before_fit.pth"
+            if os.path.exists(backup_file) and self.is_nf_trained:
+                try:
+                    print(f"🔄 Attempting to recover from backup: {backup_file}")
+                    self.load_nf_weights(backup_file, load_training_data=False)
+                    print(f"✅ Successfully recovered from backup")
+                except Exception as recovery_e:
+                    print(f"❌ Failed to recover from backup: {recovery_e}")
+                    # Reset training status if recovery fails
+                    self.is_nf_trained = False
+            else:
+                # No backup available or not previously trained
+                self.is_nf_trained = False
+                print(f"⚠️  No backup available. NFSampler training disabled.")
+
             # Clean up GPU memory even on error
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.empty_cache()
+                    print(f"🧹 GPU memory cleared after error")
+                except Exception as cleanup_e:
+                    print(f"⚠️  Could not clear GPU memory: {cleanup_e}")
+
+            # Reset CUDA context if needed
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    print(f"🔄 CUDA context synchronized")
+            except Exception as sync_e:
+                print(f"⚠️  Could not synchronize CUDA: {sync_e}")
 
     def generate_predetermined_samples(self, batch_size: int = None):
         """Generate a batch of predetermined samples from NFSampler for efficiency"""
@@ -1001,6 +1049,7 @@ class BasicRasterizer:
             print(f"TRAINING MODE: {num_samples} samples")
             if self.use_nf_sampler:
                 print(f"NFSampler will be used after {self.train_batch_size} samples")
+                print(f"Weights will be saved every 1000 samples")
 
         results = []
 
@@ -1050,7 +1099,13 @@ class BasicRasterizer:
             surface_area = outputs.get('surface_area', 0.0)
 
             # Add training data to NFSampler
-            self.add_training_data(input_5d, surface_area, sample_pdf)
+            try:
+                self.add_training_data(input_5d, surface_area, sample_pdf)
+            except Exception as training_e:
+                if self.verbose:
+                    print(f"⚠️  Error adding training data for sample {sample_id}: {training_e}")
+                    print(f"    Continuing with next sample...")
+                # Continue with next sample instead of crashing
 
             # Store results - only keep essential data, not large tensors
             result = {
@@ -1064,6 +1119,17 @@ class BasicRasterizer:
 
             results.append(result)
 
+            # Save weights every 1000 samples if NFSampler is trained
+            if self.use_nf_sampler and self.is_nf_trained and (sample_id + 1) % 1000 == 0:
+                checkpoint_file = f"nf_weights_checkpoint_{sample_id + 1}.pth"
+                try:
+                    self.save_nf_weights(checkpoint_file)
+                    if self.verbose:
+                        print(f"✅ Checkpoint saved: {checkpoint_file} (after {sample_id + 1} samples)")
+                except Exception as e:
+                    if self.verbose:
+                        print(f"❌ Failed to save checkpoint: {e}")
+
             # Periodic memory cleanup every 10 samples
             if (sample_id + 1) % 10 == 0 and torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1073,6 +1139,17 @@ class BasicRasterizer:
                 print(f"  Surface area: {surface_area:.6f}")
                 if self.use_nf_sampler:
                     print(f"  Training data: {len(self.training_data)}/{self.train_batch_size}")
+
+        # Save final weights
+        if self.use_nf_sampler and self.is_nf_trained:
+            final_weights_file = f"nf_weights_final_{num_samples}.pth"
+            try:
+                self.save_nf_weights(final_weights_file)
+                if self.verbose:
+                    print(f"✅ Final weights saved: {final_weights_file}")
+            except Exception as e:
+                if self.verbose:
+                    print(f"❌ Failed to save final weights: {e}")
 
         self._print_performance_stats()
         return results
@@ -1607,6 +1684,37 @@ class BasicRasterizer:
             }
 
         return stats
+
+    def calculate_simple_surface_area(self, depth_tensor, depth_epsilon=0.001):
+        """
+        Simple surface area calculation that counts visible surfaces (pixels with valid depth).
+        This maximizes sampling of camera locations that show the most surfaces rather than sky.
+
+        Args:
+            depth_tensor: Depth buffer tensor [H, W]
+            depth_epsilon: Minimum depth threshold to consider a pixel as showing a surface
+
+        Returns:
+            float: Number of visible surface pixels (normalized by total pixels)
+        """
+        try:
+            if depth_tensor is None:
+                return 0.0
+
+            # Count pixels with depth greater than epsilon (showing actual surfaces, not sky)
+            valid_depth_mask = depth_tensor > depth_epsilon
+            visible_surface_pixels = torch.sum(valid_depth_mask).item()
+
+            # Normalize by total pixels to get a ratio [0, 1]
+            total_pixels = depth_tensor.numel()
+            surface_ratio = visible_surface_pixels / total_pixels if total_pixels > 0 else 0.0
+
+            return surface_ratio
+
+        except Exception as e:
+            if self.verbose:
+                print(f"Error in simple surface area calculation: {e}")
+            return 0.0
 
 
 async def main():
